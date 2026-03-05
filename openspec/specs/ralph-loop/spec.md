@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## Requirements
 
 ### Requirement: Ralph loop state file format
 The Ralph loop SHALL write state to `<worktree>/.claude/loop-state.json` with a documented, stable format for MCP consumption.
@@ -12,17 +12,19 @@ The Ralph loop SHALL write state to `<worktree>/.claude/loop-state.json` with a 
 - **WHEN** Ralph writes loop-state.json
 - **THEN** JSON includes required fields:
   - `change_id`: string - the change identifier
-  - `status`: string - one of "starting", "running", "done", "stuck", "stalled", "stopped"
+  - `status`: string - one of "starting", "running", "done", "stuck", "stalled", "stopped", "waiting:human", "waiting:budget"
   - `current_iteration`: number - current iteration (1-based)
   - `max_iterations`: number - configured maximum
   - `started_at`: string - ISO 8601 timestamp
   - `task`: string - the task description
   - `iterations`: array - history of completed iterations
-  - `done_criteria`: string - "tasks" or "manual"
+  - `done_criteria`: string - "tasks", "openspec", or "manual"
   - `stall_threshold`: number - consecutive commit-less iterations before stall
   - `iteration_timeout_min`: number - per-iteration timeout in minutes
   - `total_tokens`: number - cumulative token count across all iterations
   - `label`: string or null - optional user-provided label for loop identification
+  - `session_id`: string or null - Claude session UUID for resume
+  - `resume_failures`: number - count of `--resume` failures (default 0)
 
 #### Scenario: Iteration history entry
 - **WHEN** Ralph completes an iteration
@@ -34,74 +36,29 @@ The Ralph loop SHALL write state to `<worktree>/.claude/loop-state.json` with a 
   - `commits`: array - commit hashes made
   - `tokens_used`: number - tokens consumed this iteration
   - `timed_out`: boolean - whether iteration was killed by timeout (optional, only if true)
+  - `no_op`: boolean - whether iteration produced no meaningful work (optional, only if true)
+  - `ff_exhausted`: boolean - whether ff retry limit was exceeded (optional, only if true)
+  - `ff_recovered`: boolean - whether fallback tasks.md was generated (optional, only if true)
+  - `log_file`: string - path to per-iteration log file
+  - `resumed`: boolean - whether this iteration used `--resume` (optional, only if true)
 
-### Requirement: Default done criteria
-The Ralph loop SHALL default to `tasks` done criteria instead of `manual`.
+### Requirement: Universal done detection safety net
+The Ralph loop SHALL have a fallback done check that catches completion regardless of the primary `done_criteria` setting.
 
-#### Scenario: Default done criteria with tasks.md present
-- **WHEN** user starts a loop without `--done` flag
-- **AND** a `tasks.md` file exists in the change directory or worktree
-- **THEN** done criteria SHALL be "tasks"
+#### Scenario: Tasks.md all-checked fallback triggers
+- **WHEN** the primary done criteria check (`check_done`) returns false
+- **AND** a `tasks.md` file exists in the worktree or change directory
+- **AND** all `- [ ]` tasks are checked off (zero unchecked auto-tasks)
+- **THEN** the loop SHALL treat the change as done
+- **AND** log a warning: "Done by tasks.md fallback (primary criteria '{type}' said not done)"
 
-#### Scenario: Default done criteria without tasks.md
-- **WHEN** user starts a loop without `--done` flag
-- **AND** no `tasks.md` file exists
-- **THEN** done criteria SHALL fall back to "manual"
-- **AND** a warning SHALL be displayed: "No tasks.md found, using manual done criteria"
+#### Scenario: Fallback does not override primary when tasks remain
+- **WHEN** the primary done criteria check returns false
+- **AND** `tasks.md` has unchecked `- [ ]` tasks
+- **THEN** the fallback SHALL NOT trigger
+- **AND** the loop SHALL continue normally
 
-#### Scenario: Explicit manual override
-- **WHEN** user starts a loop with `--done manual`
-- **THEN** done criteria SHALL be "manual" regardless of tasks.md presence
-
-### Requirement: Robust state recording on termination
-The Ralph loop SHALL record iteration state even on abnormal termination.
-
-#### Scenario: Loop killed by SIGTERM
-- **WHEN** the loop process receives SIGTERM during an iteration
-- **THEN** the current iteration SHALL be recorded with an `ended` timestamp
-- **AND** any commits detected so far SHALL be included
-- **AND** loop status SHALL be updated to "stopped"
-
-#### Scenario: Loop killed by SIGINT
-- **WHEN** the loop process receives SIGINT (Ctrl+C)
-- **THEN** the same cleanup as SIGTERM SHALL occur
-
-#### Scenario: Partial iteration on exit
-- **WHEN** the loop exits for any reason during an active iteration
-- **THEN** the EXIT trap SHALL ensure the iteration is recorded in the state file
-
-### Requirement: Token tracking reliability
-The Ralph loop SHALL reliably track token usage per iteration.
-
-#### Scenario: Token counting via wt-usage
-- **WHEN** an iteration completes
-- **THEN** token count SHALL be calculated as the difference between pre- and post-iteration `wt-usage --since` values
-- **AND** if the result is 0 or negative, the system SHALL log a warning to stderr
-
-#### Scenario: Token tracking failure fallback
-- **WHEN** `wt-usage` fails or returns 0
-- **THEN** the system SHALL estimate tokens from session file size growth
-- **AND** mark the value as estimated in the iteration record: `"tokens_estimated": true`
-
-### Requirement: Terminal title progress updates
-The Ralph loop terminal SHALL display current progress in the window title.
-
-#### Scenario: Title updates per iteration
-- **WHEN** a new iteration starts
-- **AND** a label is set
-- **THEN** the terminal title SHALL be updated to: "Ralph: {change_id} ({label}) [{iteration}/{max}]"
-
-#### Scenario: Title updates per iteration without label
-- **WHEN** a new iteration starts
-- **AND** no label is set
-- **THEN** the terminal title SHALL be updated to: "Ralph: {change_id} [{iteration}/{max}]"
-
-#### Scenario: Title on completion
-- **WHEN** the loop completes (done/stuck/stalled)
-- **AND** a label is set
-- **THEN** the terminal title SHALL be updated to: "Ralph: {change_id} ({label}) [{status}]"
-
-#### Scenario: Title on completion without label
-- **WHEN** the loop completes (done/stuck/stalled)
-- **AND** no label is set
-- **THEN** the terminal title SHALL be updated to: "Ralph: {change_id} [{status}]"
+#### Scenario: Fallback does not fire when no tasks.md exists
+- **WHEN** no `tasks.md` file exists
+- **THEN** the fallback SHALL NOT trigger
+- **AND** only the primary done criteria SHALL be evaluated

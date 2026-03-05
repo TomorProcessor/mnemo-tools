@@ -29,10 +29,12 @@ deploy_wt_tools() {
         ((_warnings++))
     fi
 
-    # 2. Deploy /wt:* commands
+    # 2. Deploy /wt:* commands (copy)
     local src_commands="$WT_TOOLS_ROOT/.claude/commands/wt"
     local dst_commands="$claude_dir/commands/wt"
     if [[ -d "$src_commands" ]]; then
+        # Replace symlink with directory if needed
+        [[ -L "$dst_commands" ]] && rm -f "$dst_commands"
         mkdir -p "$dst_commands"
         if [[ "$(realpath "$src_commands")" != "$(realpath "$dst_commands")" ]]; then
             cp -r "$src_commands"/* "$dst_commands/"
@@ -44,10 +46,25 @@ deploy_wt_tools() {
         warn "  Source commands not found: $src_commands"
     fi
 
-    # 3. Deploy wt skills
+    # 2b. Deploy /opsx:* commands (copy)
+    local src_opsx_commands="$WT_TOOLS_ROOT/.claude/commands/opsx"
+    local dst_opsx_commands="$claude_dir/commands/opsx"
+    if [[ -d "$src_opsx_commands" ]]; then
+        [[ -L "$dst_opsx_commands" ]] && rm -f "$dst_opsx_commands"
+        mkdir -p "$dst_opsx_commands"
+        if [[ "$(realpath "$src_opsx_commands")" != "$(realpath "$dst_opsx_commands")" ]]; then
+            cp -r "$src_opsx_commands"/* "$dst_opsx_commands/"
+        fi
+        local opsx_cmd_count
+        opsx_cmd_count=$(ls -1 "$src_opsx_commands"/*.md 2>/dev/null | wc -l)
+        success "  Deployed $opsx_cmd_count command(s) to .claude/commands/opsx/"
+    fi
+
+    # 3. Deploy wt skills (copy)
     local src_skills="$WT_TOOLS_ROOT/.claude/skills/wt"
     local dst_skills="$claude_dir/skills/wt"
     if [[ -d "$src_skills" ]]; then
+        [[ -L "$dst_skills" ]] && rm -f "$dst_skills"
         mkdir -p "$dst_skills"
         if [[ "$(realpath "$src_skills")" != "$(realpath "$dst_skills")" ]]; then
             cp -r "$src_skills"/* "$dst_skills/"
@@ -55,6 +72,24 @@ deploy_wt_tools() {
         success "  Deployed skills to .claude/skills/wt/"
     else
         warn "  Source skills not found: $src_skills"
+    fi
+
+    # 3a-ii. Deploy openspec-* skills (copy each)
+    local openspec_skill_count=0
+    for src_skill_dir in "$WT_TOOLS_ROOT/.claude/skills"/openspec-*/; do
+        [[ -d "$src_skill_dir" ]] || continue
+        local skill_name
+        skill_name=$(basename "$src_skill_dir")
+        local dst_skill_dir="$claude_dir/skills/$skill_name"
+        [[ -L "$dst_skill_dir" ]] && rm -f "$dst_skill_dir"
+        mkdir -p "$dst_skill_dir"
+        if [[ "$(realpath "$src_skill_dir")" != "$(realpath "$dst_skill_dir")" ]]; then
+            cp -r "$src_skill_dir"/* "$dst_skill_dir/"
+            openspec_skill_count=$((openspec_skill_count + 1))
+        fi
+    done
+    if [[ $openspec_skill_count -gt 0 ]]; then
+        success "  Deployed $openspec_skill_count openspec skill(s) to .claude/skills/"
     fi
 
     # 3b. Deploy rules (path-scoped project rules)
@@ -89,10 +124,11 @@ deploy_wt_tools() {
         fi
     fi
 
-    # 3c. Deploy agents (custom subagent definitions)
+    # 3c. Deploy agents (copy)
     local src_agents="$WT_TOOLS_ROOT/.claude/agents"
     local dst_agents="$claude_dir/agents"
     if [[ -d "$src_agents" ]]; then
+        [[ -L "$dst_agents" ]] && rm -f "$dst_agents"
         mkdir -p "$dst_agents"
         if [[ "$(realpath "$src_agents")" != "$(realpath "$dst_agents")" ]]; then
             cp "$src_agents"/*.md "$dst_agents/" 2>/dev/null || true

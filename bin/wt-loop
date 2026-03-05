@@ -19,6 +19,13 @@ else
     TIMEOUT_CMD=""
 fi
 
+# Find stdbuf for line-buffered output (real-time terminal visibility)
+if command -v stdbuf &>/dev/null; then
+    STDBUF_PREFIX="stdbuf -oL"
+else
+    STDBUF_PREFIX=""
+fi
+
 # Default settings
 DEFAULT_MAX_ITERATIONS=10
 DEFAULT_DONE_CRITERIA="tasks"
@@ -34,6 +41,8 @@ Run from within a worktree directory. The worktree is detected from CWD.
 Commands:
   start "<task>" [opts]    Start a new loop
   stop                     Stop a running loop
+  resume                   Resume a paused loop (waiting:budget or waiting:human)
+  budget <N>               Update token budget (in K) and resume
   status                   Show loop status
   list                     List all active loops (global)
   history                  Show iteration history
@@ -44,9 +53,12 @@ Start Options:
   --done <criteria>        Done detection: tasks|openspec|manual (default: tasks, auto-detects openspec)
   --max <n>                Max iterations (default: 10)
   --stall-threshold <n>    Stall after N commit-less iterations (default: 2)
+  --max-idle <n>           Stop after N identical-output iterations (default: 3)
   --iteration-timeout <n>  Per-iteration timeout in minutes (default: 45)
   --capacity-limit <pct>   Stop if capacity exceeds (default: 80%)
   --permission-mode <mode> Claude permission mode: auto-accept|allowedTools|plan (default: config)
+  --model <name>           Claude model: opus|sonnet|haiku or full ID (default: opus from config)
+  --token-budget <N>       Max token budget in thousands (0=unlimited, default: 0)
   --label <text>           Label for this loop instance (shown in banner and terminal title)
   --force                  Force start even with incompatible permission mode (e.g. plan)
 
@@ -104,9 +116,17 @@ get_loop_state_file() {
     echo "$wt_path/.claude/loop-state.json"
 }
 
-get_loop_log_file() {
+get_loop_log_dir() {
     local wt_path="$1"
-    echo "$wt_path/.claude/ralph-loop.log"
+    echo "$wt_path/.claude/logs"
+}
+
+get_iter_log_file() {
+    local wt_path="$1"
+    local iteration="$2"
+    local log_dir
+    log_dir=$(get_loop_log_dir "$wt_path")
+    printf '%s/ralph-iter-%03d.log' "$log_dir" "$iteration"
 }
 
 # Get terminal PID file path
@@ -125,9 +145,10 @@ find_tasks_file() {
         return
     fi
 
-    # Fallback: search in subdirectories (maxdepth 3), excluding archive/node_modules
+    # Fallback: search in subdirectories (maxdepth 4), excluding archive/node_modules
+    # Depth 4 needed for openspec/changes/<name>/tasks.md
     local found
-    found=$(find "$wt_path" -maxdepth 3 -name "tasks.md" -type f \
+    found=$(find "$wt_path" -maxdepth 4 -name "tasks.md" -type f \
         ! -path "*/archive/*" ! -path "*/node_modules/*" 2>/dev/null | head -1)
     if [[ -n "$found" ]]; then
         echo "$found"
@@ -149,6 +170,7 @@ init_loop_state() {
     local stall_threshold="${7:-$DEFAULT_STALL_THRESHOLD}"
     local iteration_timeout="${8:-45}"
     local label="${9:-}"
+    local change="${10:-}"
 
     local state_file
     state_file=$(get_loop_state_file "$wt_path")
@@ -172,7 +194,15 @@ init_loop_state() {
   "stall_threshold": $stall_threshold,
   "iteration_timeout_min": $iteration_timeout,
   "total_tokens": 0,
-  "label": $(if [[ -n "$label" ]]; then echo "\"$label\""; else echo "null"; fi)
+  "token_budget": 0,
+  "ff_attempts": 0,
+  "max_idle_iterations": 3,
+  "idle_count": 0,
+  "last_output_hash": null,
+  "session_id": null,
+  "resume_failures": 0,
+  "label": $(if [[ -n "$label" ]]; then echo "\"$label\""; else echo "null"; fi),
+  "change": $(if [[ -n "$change" ]]; then echo "\"$change\""; else echo "null"; fi)
 }
 EOF
 }
@@ -199,6 +229,11 @@ add_iteration() {
     local tokens_used="${7:-0}"
     local timed_out="${8:-false}"
     local tokens_estimated="${9:-false}"
+    local no_op="${10:-false}"
+    local ff_exhausted="${11:-false}"
+    local log_file="${12:-}"
+    local resumed="${13:-false}"
+    local ff_recovered="${14:-false}"
 
     local tmp
     tmp=$(mktemp)
@@ -210,6 +245,11 @@ add_iteration() {
        --argjson tokens "$tokens_used" \
        --argjson timed_out "$timed_out" \
        --argjson tokens_estimated "$tokens_estimated" \
+       --argjson no_op "$no_op" \
+       --argjson ff_exhausted "$ff_exhausted" \
+       --arg log_file "$log_file" \
+       --argjson resumed "$resumed" \
+       --argjson ff_recovered "$ff_recovered" \
        '.iterations += [{
          "n": $n,
          "started": $started,
@@ -218,7 +258,12 @@ add_iteration() {
          "commits": $commits,
          "tokens_used": $tokens,
          "timed_out": $timed_out,
-         "tokens_estimated": $tokens_estimated
+         "tokens_estimated": $tokens_estimated,
+         "no_op": $no_op,
+         "ff_exhausted": $ff_exhausted,
+         "log_file": $log_file,
+         "resumed": $resumed,
+         "ff_recovered": $ff_recovered
        }]' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
 }
 
@@ -279,7 +324,64 @@ update_terminal_title() {
     printf '\033]0;%s\007' "$title"
 }
 
-# Check if tasks.md is complete (all tasks checked)
+# Count manual/human tasks ([?] pattern) in tasks.md
+count_manual_tasks() {
+    local wt_path="$1"
+
+    local tasks_file
+    tasks_file=$(find_tasks_file "$wt_path")
+    [[ -z "$tasks_file" ]] && echo 0 && return
+
+    local count
+    count=$(grep -cE '^\s*-\s*\[\?\]' "$tasks_file" 2>/dev/null || true)
+    count=${count//[^0-9]/}
+    echo "${count:-0}"
+}
+
+# Parse manual tasks into JSON array: [{id, description, type, input_key}]
+parse_manual_tasks() {
+    local wt_path="$1"
+
+    local tasks_file
+    tasks_file=$(find_tasks_file "$wt_path")
+    [[ -z "$tasks_file" ]] && echo "[]" && return
+
+    local result="["
+    local first=true
+
+    while IFS= read -r line; do
+        # Extract task id (e.g. "3.3") and rest of the line
+        local task_id="" description="" task_type="confirm" input_key=""
+
+        # Match: - [?] 3.3 Description [input:KEY] or [confirm]
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[\?\][[:space:]]+([0-9]+\.[0-9]+)[[:space:]]+(.*) ]]; then
+            task_id="${BASH_REMATCH[1]}"
+            local rest="${BASH_REMATCH[2]}"
+
+            # Extract type annotation if present
+            if [[ "$rest" =~ \[input:([^\]]+)\] ]]; then
+                task_type="input"
+                input_key="${BASH_REMATCH[1]}"
+                description="${rest% \[input:*}"
+            elif [[ "$rest" =~ \[confirm\] ]]; then
+                task_type="confirm"
+                description="${rest% \[confirm\]}"
+            else
+                description="$rest"
+            fi
+
+            $first || result+=","
+            first=false
+            result+=$(printf '{"id":"%s","description":%s,"type":"%s","input_key":"%s"}' \
+                "$task_id" "$(echo "$description" | jq -Rs .)" "$task_type" "$input_key")
+        fi
+    done < <(grep -E '^\s*-\s*\[\?\]' "$tasks_file" 2>/dev/null)
+
+    result+="]"
+    echo "$result"
+}
+
+# Check if tasks.md is complete (all auto-tasks checked)
 check_tasks_done() {
     local wt_path="$1"
 
@@ -292,32 +394,77 @@ check_tasks_done() {
         return 1
     fi
 
-    # Count incomplete tasks (- [ ] pattern)
+    # Count incomplete auto-tasks (- [ ] pattern only)
+    # Note: [?] manual tasks are NOT counted here — they are handled
+    # separately by the waiting:human detection. The regex \[\s*\] matches
+    # only whitespace inside brackets, so [?] is naturally excluded.
     local count
-    count=$(grep -cE '^\s*-\s*\[\s*\]' "$tasks_file" 2>/dev/null)
+    count=$(grep -cE '^\s*-\s*\[\s*\]' "$tasks_file" 2>/dev/null || true)
     count=${count//[^0-9]/}  # Strip any non-digit characters
     count=${count:-0}
 
     if [[ "$count" -eq 0 ]]; then
-        return 0  # All done
+        return 0  # All auto-tasks done
     else
         return 1  # Not done
     fi
+}
+
+# Generate a minimal fallback tasks.md when ff exhausted (no tasks.md created by opsx:ff).
+# Reads proposal.md (and design.md if present) to give the agent enough context.
+# Returns 0 if tasks.md was created, 1 if insufficient context (no proposal.md).
+generate_fallback_tasks() {
+    local wt_path="$1"
+    local change_name="$2"
+    local change_dir="$wt_path/openspec/changes/$change_name"
+
+    # Need at least proposal.md to generate meaningful tasks
+    if [[ ! -f "$change_dir/proposal.md" ]]; then
+        return 1
+    fi
+
+    local tasks_file="$change_dir/tasks.md"
+
+    # Don't overwrite existing tasks.md
+    if [[ -f "$tasks_file" ]]; then
+        return 0
+    fi
+
+    # Read scope from proposal
+    local scope
+    scope=$(head -20 "$change_dir/proposal.md" 2>/dev/null | tail -15)
+
+    local context_note="proposal.md"
+    if [[ -f "$change_dir/design.md" ]]; then
+        context_note="proposal.md and design.md"
+    fi
+
+    cat > "$tasks_file" <<FALLBACK_EOF
+# Tasks
+
+- [ ] Implement the change as described in $context_note. Read the artifacts in openspec/changes/$change_name/ for full scope and design details.
+FALLBACK_EOF
+
+    warn "Generated fallback tasks.md from proposal (ff exhausted)"
+    return 0
 }
 
 # Check done criteria
 check_done() {
     local wt_path="$1"
     local criteria="$2"
+    local target_change="${3:-}"
 
     case "$criteria" in
         tasks)
             check_tasks_done "$wt_path"
             ;;
         openspec)
-            # All OpenSpec changes complete when detect_next_change_action returns "done"
+            # When --change is set, only check that specific change
+            # When --change is not set, scan all changes (existing behavior)
             local action
-            action=$(detect_next_change_action "$wt_path")
+            action=$(detect_next_change_action "$wt_path" "$target_change")
+            warn "check_done openspec: action='$action' target='$target_change'"
             [[ "$action" == "done" ]]
             ;;
         manual)
@@ -327,6 +474,43 @@ check_done() {
             local manual_done
             manual_done=$(jq -r '.manual_done // false' "$state_file" 2>/dev/null)
             [[ "$manual_done" == "true" ]]
+            ;;
+        build)
+            # Build command passes = done
+            local pm="npm"
+            [[ -f "$wt_path/pnpm-lock.yaml" ]] && pm="pnpm"
+            [[ -f "$wt_path/yarn.lock" ]] && pm="yarn"
+            [[ -f "$wt_path/bun.lockb" || -f "$wt_path/bun.lock" ]] && pm="bun"
+            local build_cmd=""
+            if [[ -f "$wt_path/package.json" ]]; then
+                build_cmd=$(cd "$wt_path" && node -e "
+                    const p = require('./package.json');
+                    const s = p.scripts || {};
+                    if (s['build:ci']) console.log('build:ci');
+                    else if (s['build']) console.log('build');
+                " 2>/dev/null || true)
+            fi
+            if [[ -n "$build_cmd" ]]; then
+                (cd "$wt_path" && timeout 300 "$pm" run "$build_cmd" >/dev/null 2>&1)
+            else
+                return 0  # No build command = pass
+            fi
+            ;;
+        merge)
+            # Branch merges cleanly with main = done
+            local main_ref
+            main_ref=$(git -C "$wt_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+                | sed 's@^refs/remotes/origin/@@' || echo "main")
+            git -C "$wt_path" fetch origin "$main_ref" 2>/dev/null || true
+            local cur_branch
+            cur_branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            local mb
+            mb=$(git -C "$wt_path" merge-base "$cur_branch" "origin/$main_ref" 2>/dev/null || true)
+            if [[ -n "$mb" ]]; then
+                ! git -C "$wt_path" merge-tree "$mb" "origin/$main_ref" "$cur_branch" 2>/dev/null | grep -q "^<<<<<<<"
+            else
+                return 1
+            fi
             ;;
         *)
             warn "Unknown done criteria: $criteria"
@@ -350,11 +534,51 @@ get_new_commits() {
 }
 
 # Detect the next OpenSpec change action needed.
-# Returns: "ff:<change-name>" or "apply:<change-name>" or "done"
+# Args: $1=wt_path, $2=target_change (optional — if set, only inspect that change)
+# Returns: "ff:<change-name>" or "apply:<change-name>" or "done" or "none"
 detect_next_change_action() {
     local wt_path="$1"
+    local target_change="${2:-}"
 
-    # Get ordered change names from docs/benchmark/NN-*.md or openspec/changes/
+    # If a specific change is targeted, only inspect that one
+    if [[ -n "$target_change" ]]; then
+        local change_dir="$wt_path/openspec/changes/$target_change"
+        local tasks_file="$change_dir/tasks.md"
+
+        if [[ ! -d "$change_dir" ]]; then
+            # Check if change was archived (moved to archive/ with date prefix)
+            local archived
+            archived=$(find "$wt_path/openspec/changes/archive" -maxdepth 1 -type d -name "*-$target_change" 2>/dev/null | head -1)
+            if [[ -n "$archived" ]]; then
+                echo "done"
+            else
+                echo "none"
+            fi
+            return
+        fi
+
+        # Does tasks.md exist? (ff done)
+        if [[ ! -f "$tasks_file" ]]; then
+            echo "ff:$target_change"
+            return
+        fi
+
+        # Are all tasks checked? (apply done)
+        local unchecked
+        unchecked=$(grep -cE '^\s*-\s*\[\s*\]' "$tasks_file" 2>/dev/null || true)
+        unchecked=${unchecked//[^0-9]/}
+        unchecked=${unchecked:-0}
+        if [[ "$unchecked" -gt 0 ]]; then
+            echo "apply:$target_change"
+            return
+        fi
+
+        echo "done"
+        return
+    fi
+
+    # No target change — scan all changes (used by check_done for solo loops
+    # and benchmark mode with numbered files)
     local change_order=()
     if ls "$wt_path"/docs/benchmark/[0-9]*.md &>/dev/null; then
         # Derive from numbered benchmark files: 01-product-catalog.md → product-catalog
@@ -400,7 +624,7 @@ detect_next_change_action() {
 
         # Check 2: Are all tasks checked? (apply done)
         local unchecked
-        unchecked=$(grep -cE '^\s*-\s*\[\s*\]' "$tasks_file" 2>/dev/null)
+        unchecked=$(grep -cE '^\s*-\s*\[\s*\]' "$tasks_file" 2>/dev/null || true)
         unchecked=${unchecked//[^0-9]/}  # Strip non-digit chars
         unchecked=${unchecked:-0}
         if [[ "$unchecked" -gt 0 ]]; then
@@ -419,6 +643,7 @@ build_prompt() {
     local max_iter="$3"
     local wt_path="$4"
     local done_criteria="$5"
+    local target_change="${6:-}"
 
     local prev_commits=""
     local state_file
@@ -440,8 +665,9 @@ build_prompt() {
     local specific_task=""
     local openspec_instructions=""
 
-    if [[ -d "$wt_path/openspec" ]]; then
-        change_action=$(detect_next_change_action "$wt_path")
+    if [[ -d "$wt_path/openspec" ]] && [[ "$done_criteria" == "openspec" ]] && [[ -n "$target_change" ]]; then
+        # Scoped detection: only inspect the assigned change
+        change_action=$(detect_next_change_action "$wt_path" "$target_change")
 
         case "$change_action" in
             ff:*)
@@ -497,6 +723,18 @@ Before you stop, write .claude/reflection.md with 3-5 bullet points:
 If nothing notable happened, write \"No notable issues.\" to the file."
     fi
 
+    # Detect manual tasks and add instruction to skip them
+    local manual_task_instruction=""
+    local manual_count
+    manual_count=$(count_manual_tasks "$wt_path")
+    if [[ "$manual_count" -gt 0 ]]; then
+        manual_task_instruction="
+# Manual Tasks
+Tasks marked with [?] in tasks.md require human action (e.g., providing API keys, external setup).
+Do NOT attempt to complete [?] tasks — skip them entirely and focus only on [ ] tasks.
+If all [ ] tasks are done but [?] tasks remain, commit your work and stop."
+    fi
+
     cat <<EOF
 # Task
 $effective_task
@@ -511,6 +749,7 @@ Previous work is visible in the git history and current file state.
 3. Do ONLY what is specified in YOUR TASK above — nothing more
 4. If stuck on the same issue, try a different approach
 $openspec_instructions
+$manual_task_instruction
 # Previous Work
 $prev_text
 
@@ -545,9 +784,15 @@ cmd_run() {
     task=$(jq -r '.task' "$state_file")
     capacity_limit=$(jq -r '.capacity_limit_pct' "$state_file")
     stall_threshold=$(jq -r '.stall_threshold // 2' "$state_file")
+    local max_idle_iters
+    max_idle_iters=$(jq -r '.max_idle_iterations // 3' "$state_file")
     iteration_timeout_min=$(jq -r '.iteration_timeout_min // 45' "$state_file")
     label=$(jq -r '.label // empty' "$state_file")
     permission_mode=$(jq -r '.permission_mode // "default"' "$state_file")
+    local claude_model
+    claude_model=$(jq -r '.model // empty' "$state_file")
+    local change_name
+    change_name=$(jq -r '.change // empty' "$state_file")
 
     # Signal trap variables for cleanup
     local current_iter_started=""
@@ -591,6 +836,11 @@ cmd_run() {
 
     cd "$wt_path" || exit 1
 
+    # Ensure per-iteration log directory exists (task 1.1)
+    local log_dir
+    log_dir=$(get_loop_log_dir "$wt_path")
+    mkdir -p "$log_dir"
+
     # Gather context for banner
     local git_branch
     git_branch=$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "unknown")
@@ -613,16 +863,34 @@ cmd_run() {
     echo "║  Branch: $git_branch"
     echo "║  Task: $task"
     echo "║  ──────────────────────────────────────────────────────────────"
-    echo "║  Mode: $permission_mode | Max: $max_iter | Stall: $stall_threshold | Timeout: ${iteration_timeout_min}m"
-    echo "║  Memory: $memory_status"
+    local token_budget
+    token_budget=$(jq -r '.token_budget // 0' "$state_file")
+    local budget_display="unlimited"
+    if [[ "$token_budget" -gt 0 ]] 2>/dev/null; then
+        budget_display="$((token_budget / 1000))K"
+    fi
+    echo "║  Mode: $permission_mode | Model: ${claude_model:-default} | Max: $max_iter | Stall: $stall_threshold | Idle: $max_idle_iters | Timeout: ${iteration_timeout_min}m"
+    echo "║  Memory: $memory_status | Budget: $budget_display"
     echo "║  Started: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    if [[ -n "$claude_model" ]]; then
+        echo "🤖 Claude model: $claude_model"
+    else
+        echo "🤖 Claude model: (router default)"
+    fi
     echo ""
 
     local iteration=0
     local stall_count=0
     local repeated_msg_count=0
     local last_commit_msg=""
+    local idle_count=0
+    local last_output_hash=""
+    local ff_attempts=0
+    local ff_max_retries
+    ff_max_retries=$(jq -r '.ff_max_retries // 2' "$state_file")
     local start_time
     start_time=$(date -Iseconds)
 
@@ -653,11 +921,15 @@ cmd_run() {
 
         # Build prompt
         local prompt
-        prompt=$(build_prompt "$task" "$iteration" "$max_iter" "$wt_path" "$done_criteria")
+        prompt=$(build_prompt "$task" "$iteration" "$max_iter" "$wt_path" "$done_criteria" "$change_name")
+
+        # Per-iteration log file (task 1.2)
+        local iter_log_file
+        iter_log_file=$(get_iter_log_file "$wt_path" "$iteration")
 
         # Run Claude with retry logic and per-iteration timeout
         local timeout_seconds=$((iteration_timeout_min * 60))
-        echo "Starting Claude Code... (timeout: ${iteration_timeout_min}m)"
+        echo "Starting Claude Code... (timeout: ${iteration_timeout_min}m, log: $iter_log_file)"
         echo ""
 
         local claude_exit_code=0
@@ -671,20 +943,60 @@ cmd_run() {
         local perm_flags
         perm_flags=$(get_claude_permission_flags "$perm_mode")
 
+        # Build model flag from state
+        local model_flag=""
+        local state_model
+        state_model=$(jq -r '.model // empty' "$state_file" 2>/dev/null)
+        if [[ -n "$state_model" ]]; then
+            model_flag="--model $state_model"
+        fi
+
+        # Session continuation flags (task 2.2, 2.3)
+        local session_flags=""
+        local is_resumed=false
+        local session_id
+        session_id=$(jq -r '.session_id // empty' "$state_file" 2>/dev/null)
+        local resume_failures
+        resume_failures=$(jq -r '.resume_failures // 0' "$state_file" 2>/dev/null)
+
+        if [[ $iteration -eq 1 ]] || [[ -z "$session_id" ]] || [[ "$resume_failures" -ge 3 ]]; then
+            # First iteration or no session or too many resume failures: new session
+            session_id=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+            session_flags="--session-id $session_id"
+            update_loop_state "$state_file" "session_id" "\"$session_id\""
+            if [[ "$resume_failures" -ge 3 ]]; then
+                echo "⚠️  Too many resume failures ($resume_failures), using fresh session"
+            fi
+        else
+            # Subsequent iteration: resume existing session
+            session_flags="--resume $session_id"
+            is_resumed=true
+        fi
+
+        # Build effective prompt: short for resumed sessions (task 2.4)
+        local effective_prompt="$prompt"
+        if $is_resumed; then
+            effective_prompt="Continue where you left off. Check the task status and complete remaining work."
+        fi
+
         while [[ $retry_count -lt $max_retries ]]; do
             # Pipe prompt via stdin to run in interactive mode (not -p print mode).
             # Interactive mode enables skills (/opsx:ff, /opsx:apply) and hooks.
             # - env -u CLAUDECODE: allow claude when invoked from a Claude session
             # - --foreground: keep child in foreground process group (prevents Tl stops)
+            # - Output tee'd to per-iteration log file (task 1.3)
+            local iter_start_epoch_resume
+            iter_start_epoch_resume=$(date +%s)
+
             if [[ -n "$TIMEOUT_CMD" ]]; then
-                echo "$prompt" | env -u CLAUDECODE $TIMEOUT_CMD --foreground --signal=TERM "$timeout_seconds" \
-                    claude $perm_flags \
-                       --verbose
+                echo "$effective_prompt" | env -u CLAUDECODE $STDBUF_PREFIX $TIMEOUT_CMD --foreground --signal=TERM "$timeout_seconds" \
+                    claude $perm_flags $model_flag $session_flags \
+                       --verbose 2>&1 | $STDBUF_PREFIX tee -a "$iter_log_file"
             else
-                echo "$prompt" | env -u CLAUDECODE claude $perm_flags \
-                   --verbose
+                echo "$effective_prompt" | env -u CLAUDECODE $STDBUF_PREFIX claude $perm_flags $model_flag $session_flags \
+                   --verbose 2>&1 | $STDBUF_PREFIX tee -a "$iter_log_file"
             fi
-            claude_exit_code=$?
+            claude_exit_code=${PIPESTATUS[0]:-$?}
 
             if [[ $claude_exit_code -eq 124 ]]; then
                 # Timeout exit code
@@ -697,6 +1009,24 @@ cmd_run() {
 
             if [[ $claude_exit_code -eq 0 ]]; then
                 break  # Success
+            fi
+
+            # Resume failure detection (task 2.5): if resumed session failed quickly, fallback
+            if $is_resumed; then
+                local elapsed=$(( $(date +%s) - iter_start_epoch_resume ))
+                if [[ $elapsed -lt 5 ]]; then
+                    echo "⚠️  Session resume failed (exit $claude_exit_code in ${elapsed}s), falling back to fresh session"
+                    resume_failures=$((resume_failures + 1))
+                    update_loop_state "$state_file" "resume_failures" "$resume_failures"
+                    # Generate new session ID and retry with fresh session
+                    session_id=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+                    session_flags="--session-id $session_id"
+                    update_loop_state "$state_file" "session_id" "\"$session_id\""
+                    is_resumed=false
+                    effective_prompt="$prompt"
+                    retry_count=$((retry_count + 1))
+                    continue
+                fi
             fi
 
             retry_count=$((retry_count + 1))
@@ -744,10 +1074,10 @@ cmd_run() {
                     local last_msg
                     last_msg=$(cd "$wt_path" && git log -1 --format='%s' 2>/dev/null || echo "")
                     if [[ "$last_msg" == *:* ]]; then
-                        local change_name="${last_msg%%:*}"
+                        local commit_change_name="${last_msg%%:*}"
                         # Validate: change name should be kebab-case, not too long
-                        if [[ "$change_name" =~ ^[a-z][a-z0-9-]+$ && ${#change_name} -lt 40 ]]; then
-                            change_tag="change:$change_name,"
+                        if [[ "$commit_change_name" =~ ^[a-z][a-z0-9-]+$ && ${#commit_change_name} -lt 40 ]]; then
+                            change_tag="change:$commit_change_name,"
                         fi
                     fi
 
@@ -815,6 +1145,50 @@ except:
             echo "📊 Iteration tokens: $tokens_used (total: $tokens_after)"
         fi
 
+        # Post-iteration log summary (task 1.5)
+        if [[ -s "$iter_log_file" ]]; then
+            local log_reads log_writes log_skills log_errors
+            log_reads=$(grep -c 'Read(' "$iter_log_file" 2>/dev/null || echo 0)
+            log_writes=$(grep -c -E 'Write\(|Edit\(' "$iter_log_file" 2>/dev/null || echo 0)
+            log_skills=$(grep -c -E '/opsx:|/wt:' "$iter_log_file" 2>/dev/null || echo 0)
+            log_errors=$(grep -c -iE 'error|Error:' "$iter_log_file" 2>/dev/null || echo 0)
+            echo "📋 Log summary: ${log_reads} reads, ${log_writes} writes, ${log_skills} skills, ${log_errors} errors"
+        elif [[ -f "$iter_log_file" ]]; then
+            echo "📋 No log output captured"
+        fi
+
+        # Output-level idle detection: stop if same output repeats N times
+        if [[ -s "$iter_log_file" ]]; then
+            local current_hash
+            current_hash=$(tail -200 "$iter_log_file" | md5sum | cut -d' ' -f1)
+            if [[ -n "$last_output_hash" && "$current_hash" == "$last_output_hash" ]]; then
+                idle_count=$((idle_count + 1))
+                echo "⚠️  Identical output detected ($idle_count/$max_idle_iters)"
+                if [[ $idle_count -ge $max_idle_iters ]]; then
+                    echo ""
+                    echo "╔════════════════════════════════════════════════════════════════╗"
+                    echo "║  🛑 IDLE: Identical output for $idle_count consecutive iterations  ║"
+                    echo "║  The agent is repeating the same response without progress.       ║"
+                    echo "╚════════════════════════════════════════════════════════════════╝"
+                    update_loop_state "$state_file" "status" '"idle"'
+                    update_loop_state "$state_file" "idle_count" "$idle_count"
+                    update_terminal_title "Ralph: ${worktree_name}${title_suffix} [idle]"
+                    trap - EXIT SIGTERM SIGINT
+                    notify-send "Ralph Loop Idle" "$worktree_name: identical output $idle_count times" 2>/dev/null || true
+                    # Record this iteration before exiting
+                    local idle_iter_end
+                    idle_iter_end=$(date -Iseconds)
+                    add_iteration "$state_file" "$iteration" "$iter_start" "$idle_iter_end" "false" "$new_commits" "$tokens_used" "$iter_timed_out" "$tokens_estimated" "true" "false" "$iter_log_file" "$is_resumed" "false"
+                    exit 0
+                fi
+            else
+                idle_count=0
+            fi
+            last_output_hash="$current_hash"
+            update_loop_state "$state_file" "idle_count" "$idle_count"
+            update_loop_state "$state_file" "last_output_hash" "\"$current_hash\""
+        fi
+
         # Stall detection: no commits = no progress
         # Exception: ff iterations create artifacts without committing — check for new/modified files
         local has_artifact_progress=false
@@ -832,6 +1206,33 @@ except:
 
             # Check for stall condition
             if [[ $stall_count -ge $stall_threshold ]]; then
+                # Before declaring stall, check if this is actually a waiting:human situation
+                # Auto-tasks done + manual tasks remain = waiting for human, not stalled
+                local manual_count
+                manual_count=$(count_manual_tasks "$wt_path")
+                if check_tasks_done "$wt_path" && [[ "$manual_count" -gt 0 ]]; then
+                    local manual_tasks_json
+                    manual_tasks_json=$(parse_manual_tasks "$wt_path")
+                    echo ""
+                    echo "╔════════════════════════════════════════════════════════════════╗"
+                    echo "║  ⏸  WAITING FOR HUMAN: $manual_count manual task(s) pending      ║"
+                    echo "║  All automated tasks complete. Human action required.            ║"
+                    echo "║  Run: wt-manual show $(basename "$wt_path")                      ║"
+                    echo "╚════════════════════════════════════════════════════════════════╝"
+                    update_loop_state "$state_file" "status" '"waiting:human"'
+                    # Write manual task details to loop-state
+                    local tmp_state
+                    tmp_state=$(jq --argjson mt "$manual_tasks_json" \
+                        --arg ws "$(date -Iseconds)" \
+                        '.manual_tasks = $mt | .waiting_since = $ws' "$state_file")
+                    echo "$tmp_state" > "$state_file"
+                    update_terminal_title "Ralph: ${worktree_name}${title_suffix} [waiting:human]"
+                    notify-send "Ralph Loop — Human Action Required" \
+                        "$worktree_name has $manual_count manual task(s) pending" 2>/dev/null || true
+                    trap - EXIT SIGTERM SIGINT
+                    exit 0
+                fi
+
                 echo ""
                 echo "╔════════════════════════════════════════════════════════════════╗"
                 echo "║  🛑 STALLED: No commits in $stall_count iteration(s)            ║"
@@ -874,18 +1275,169 @@ except:
             fi
         fi
 
+        # FF retry tracking: if this was an ff: iteration, check if tasks.md was created
+        local iter_ff_exhausted=false
+        local iter_ff_recovered=false
+        local iter_no_op=false
+        if [[ "$done_criteria" == "openspec" && -n "$change_name" ]]; then
+            local post_action
+            post_action=$(detect_next_change_action "$wt_path" "$change_name")
+            if [[ "$post_action" == ff:* ]]; then
+                # FF ran but tasks.md still missing
+                ff_attempts=$((ff_attempts + 1))
+                update_loop_state "$state_file" "ff_attempts" "$ff_attempts"
+                echo "FF attempt $ff_attempts/$ff_max_retries failed — tasks.md not created"
+                if [[ $ff_attempts -ge $ff_max_retries ]]; then
+                    # Try to recover by generating fallback tasks.md from proposal
+                    if generate_fallback_tasks "$wt_path" "$change_name"; then
+                        iter_ff_recovered=true
+                        ff_attempts=0
+                        update_loop_state "$state_file" "ff_attempts" "0"
+                        echo "✓ Recovery: fallback tasks.md generated — continuing loop"
+                    else
+                        iter_ff_exhausted=true
+                        echo ""
+                        echo "╔════════════════════════════════════════════════════════════════╗"
+                        echo "║  FF failed to create tasks.md after $ff_max_retries attempts       ║"
+                        echo "║  No proposal.md found — cannot recover. Stalling.                  ║"
+                        echo "╚════════════════════════════════════════════════════════════════╝"
+                        # Record iteration, then exit
+                    fi
+                fi
+            else
+                # tasks.md exists (action is apply: or done) — reset counter
+                if [[ $ff_attempts -gt 0 ]]; then
+                    ff_attempts=0
+                    update_loop_state "$state_file" "ff_attempts" "0"
+                fi
+
+                # ff→apply chaining: if ff just created tasks.md, chain apply in same iteration
+                # This eliminates the iteration boundary where memory injection confuses the agent
+                if [[ "$post_action" == apply:* ]] && $has_artifact_progress; then
+                    local chain_change="${post_action#apply:}"
+                    echo ""
+                    echo "🔗 Chaining: ff created tasks.md → running apply in same iteration"
+                    echo ""
+
+                    # Build apply prompt
+                    local chain_prompt
+                    chain_prompt=$(build_prompt "$task" "$iteration" "$max_iter" "$wt_path" "$done_criteria" "$chain_change")
+
+                    # Run chained Claude invocation (fresh session — resume won't have apply context)
+                    local chain_session_id chain_log_file chain_exit=0
+                    chain_session_id=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
+                    chain_log_file="${iter_log_file%.log}-chain.log"
+
+                    if [[ -n "$TIMEOUT_CMD" ]]; then
+                        echo "$chain_prompt" | env -u CLAUDECODE $STDBUF_PREFIX $TIMEOUT_CMD --foreground --signal=TERM "$timeout_seconds" \
+                            claude $perm_flags $model_flag --session-id "$chain_session_id" \
+                               --verbose 2>&1 | $STDBUF_PREFIX tee -a "$chain_log_file"
+                    else
+                        echo "$chain_prompt" | env -u CLAUDECODE $STDBUF_PREFIX claude $perm_flags $model_flag --session-id "$chain_session_id" \
+                           --verbose 2>&1 | $STDBUF_PREFIX tee -a "$chain_log_file"
+                    fi
+                    chain_exit=${PIPESTATUS[0]:-$?}
+
+                    # Collect chained commits
+                    local chain_commits
+                    chain_commits=$(get_new_commits "$wt_path" "$iter_end")
+                    if [[ "$chain_commits" != "[]" ]] && [[ -n "$chain_commits" ]]; then
+                        echo "🔗 Chained apply produced commits"
+                        # Merge chained commits into this iteration's commits
+                        new_commits=$(echo "[$new_commits, $chain_commits]" | jq -s 'flatten' 2>/dev/null || echo "$new_commits")
+                        # Reset stall counter — chained apply made progress
+                        stall_count=0
+                    fi
+
+                    # Update iter_end and tokens after chain
+                    iter_end=$(date -Iseconds)
+                    local chain_tokens_after
+                    chain_tokens_after=$(get_current_tokens "$start_time")
+                    local chain_tokens_used=$((chain_tokens_after - tokens_after))
+                    [[ $chain_tokens_used -lt 0 ]] && chain_tokens_used=0
+                    tokens_used=$((tokens_used + chain_tokens_used))
+                    tokens_after=$chain_tokens_after
+                    echo "🔗 Chain complete (exit: $chain_exit, +${chain_tokens_used} tokens)"
+                fi
+            fi
+        fi
+
+        # No-op iteration marker for session-end hooks
+        if { [[ "$new_commits" == "[]" ]] || [[ -z "$new_commits" ]]; } && ! $has_artifact_progress; then
+            iter_no_op=true
+            echo "$(date -Iseconds)" > "$wt_path/.claude/loop-iteration-noop"
+        else
+            rm -f "$wt_path/.claude/loop-iteration-noop"
+        fi
+
         # Check done
         local is_done=false
-        if check_done "$wt_path" "$done_criteria"; then
+        if check_done "$wt_path" "$done_criteria" "$change_name"; then
             is_done=true
         fi
 
+        # Universal done detection safety net (tasks 5.1-5.4)
+        # If primary criteria says not done, check if tasks.md has all tasks [x]
+        if ! $is_done && [[ "$done_criteria" != "tasks" ]]; then
+            if find_tasks_file "$wt_path" &>/dev/null && check_tasks_done "$wt_path" 2>/dev/null; then
+                is_done=true
+                warn "Done by tasks.md fallback (primary criteria '$done_criteria' said not done)"
+            fi
+        fi
+
         # Add iteration to state with token tracking
-        add_iteration "$state_file" "$iteration" "$iter_start" "$iter_end" "$is_done" "$new_commits" "$tokens_used" "$iter_timed_out" "$tokens_estimated"
+        add_iteration "$state_file" "$iteration" "$iter_start" "$iter_end" "$is_done" "$new_commits" "$tokens_used" "$iter_timed_out" "$tokens_estimated" "$iter_no_op" "$iter_ff_exhausted" "$iter_log_file" "$is_resumed" "$iter_ff_recovered"
+
+        # Handle ff exhaustion (after recording iteration)
+        if $iter_ff_exhausted; then
+            update_loop_state "$state_file" "status" '"stalled"'
+            update_terminal_title "Ralph: ${worktree_name}${title_suffix} [stalled:ff]"
+            trap - EXIT SIGTERM SIGINT
+            notify-send "Ralph Loop Stalled" "$worktree_name: FF failed to create tasks.md after $ff_max_retries attempts" 2>/dev/null || true
+            exit 0
+        fi
         current_iter_started=""  # Clear so trap doesn't double-record
 
         # Update total tokens in state
         update_loop_state "$state_file" "total_tokens" "$tokens_after"
+
+        # Token budget enforcement → waiting:budget human checkpoint (task 3.1-3.3)
+        if [[ "$token_budget" -gt 0 && "$tokens_after" -gt "$token_budget" ]] 2>/dev/null; then
+            local budget_k=$((token_budget / 1000))
+            local used_k=$((tokens_after / 1000))
+            echo ""
+            echo "╔════════════════════════════════════════════════════════════════╗"
+            echo "║  ⏸  BUDGET CHECKPOINT: ${used_k}K / ${budget_k}K                 ║"
+            echo "║  The loop exceeded the estimated token budget.                   ║"
+            echo "║                                                                  ║"
+            echo "║  Continue:  wt-loop resume                                       ║"
+            echo "║  Raise:     wt-loop budget <N>                                   ║"
+            echo "║  Stop:      wt-loop stop                                         ║"
+            echo "╚════════════════════════════════════════════════════════════════╝"
+            update_loop_state "$state_file" "status" '"waiting:budget"'
+            update_terminal_title "Ralph: ${worktree_name}${title_suffix} [waiting:budget]"
+            notify-send "Ralph Loop — Budget Checkpoint" "$worktree_name: ${used_k}K / ${budget_k}K tokens — waiting for approval" 2>/dev/null || true
+
+            # Wait loop: poll state file every 30s for status change (task 3.2)
+            while true; do
+                sleep 30
+                local current_budget_status
+                current_budget_status=$(jq -r '.status' "$state_file" 2>/dev/null)
+                if [[ "$current_budget_status" == "running" ]]; then
+                    echo ""
+                    echo "✅ Budget checkpoint approved, continuing..."
+                    # Re-read token_budget in case it was updated via wt-loop budget
+                    token_budget=$(jq -r '.token_budget // 0' "$state_file")
+                    break
+                elif [[ "$current_budget_status" == "stopped" ]]; then
+                    echo ""
+                    echo "Loop stopped by user."
+                    trap - EXIT SIGTERM SIGINT
+                    exit 0
+                fi
+                # Still waiting:budget — continue polling
+            done
+        fi
 
         if $is_done; then
             # Calculate total time
@@ -975,11 +1527,15 @@ cmd_start() {
     local done_criteria="$DEFAULT_DONE_CRITERIA"
     local capacity_limit="$DEFAULT_CAPACITY_LIMIT"
     local stall_threshold="$DEFAULT_STALL_THRESHOLD"
+    local max_idle_iterations=3
     local iteration_timeout=45
     local fullscreen=false
     local permission_mode_override=""
+    local model_override=""
     local force_start=false
     local label=""
+    local change_name=""
+    local token_budget_k=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -996,6 +1552,10 @@ cmd_start() {
                 stall_threshold="$2"
                 shift 2
                 ;;
+            --max-idle)
+                max_idle_iterations="$2"
+                shift 2
+                ;;
             --iteration-timeout)
                 iteration_timeout="$2"
                 shift 2
@@ -1008,6 +1568,10 @@ cmd_start() {
                 permission_mode_override="$2"
                 shift 2
                 ;;
+            --model)
+                model_override="$2"
+                shift 2
+                ;;
             --force)
                 force_start=true
                 shift
@@ -1018,6 +1582,14 @@ cmd_start() {
                 ;;
             --label)
                 label="$2"
+                shift 2
+                ;;
+            --change)
+                change_name="$2"
+                shift 2
+                ;;
+            --token-budget)
+                token_budget_k="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -1108,14 +1680,30 @@ cmd_start() {
 
     # Initialize state
     info "Initializing loop state..."
-    init_loop_state "$wt_path" "$worktree_name" "$task" "$max_iter" "$done_criteria" "$capacity_limit" "$stall_threshold" "$iteration_timeout" "$label"
+    init_loop_state "$wt_path" "$worktree_name" "$task" "$max_iter" "$done_criteria" "$capacity_limit" "$stall_threshold" "$iteration_timeout" "$label" "$change_name"
 
-    # Save permission mode in state
+    # Save permission mode and idle threshold in state
     local state_file_init
     state_file_init=$(get_loop_state_file "$wt_path")
     local tmp_pm
     tmp_pm=$(mktemp)
-    jq --arg pm "$effective_permission_mode" '.permission_mode = $pm' "$state_file_init" > "$tmp_pm" && mv "$tmp_pm" "$state_file_init"
+    jq --arg pm "$effective_permission_mode" --argjson mi "$max_idle_iterations" \
+        '.permission_mode = $pm | .max_idle_iterations = $mi' "$state_file_init" > "$tmp_pm" && mv "$tmp_pm" "$state_file_init"
+
+    # Resolve and save model in state (default: opus)
+    local effective_model
+    effective_model=$(resolve_model_id "${model_override:-opus}")
+    local tmp_model
+    tmp_model=$(mktemp)
+    jq --arg m "$effective_model" '.model = $m' "$state_file_init" > "$tmp_model" && mv "$tmp_model" "$state_file_init"
+
+    # Save token budget in state (N in thousands → raw tokens)
+    if [[ -n "$token_budget_k" && "$token_budget_k" -gt 0 ]] 2>/dev/null; then
+        local budget_raw=$((token_budget_k * 1000))
+        local tmp_budget
+        tmp_budget=$(mktemp)
+        jq --argjson b "$budget_raw" '.token_budget = $b' "$state_file_init" > "$tmp_budget" && mv "$tmp_budget" "$state_file_init"
+    fi
 
     # Spawn terminal with logging
     info "Spawning terminal for Ralph loop..."
@@ -1124,29 +1712,23 @@ cmd_start() {
     if [[ -n "$label" ]]; then
         terminal_title="Ralph: $worktree_name ($label)"
     fi
-    local log_file
-    log_file=$(get_loop_log_file "$wt_path")
+    local log_dir
+    log_dir=$(get_loop_log_dir "$wt_path")
+    mkdir -p "$log_dir"
 
-    # Clear previous log
-    > "$log_file"
-
-    # Save log path to state
+    # Save log dir path to state
     local state_file
     state_file=$(get_loop_state_file "$wt_path")
-    jq --arg log "$log_file" '.log_file = $log' "$state_file" > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
+    jq --arg log "$log_dir" '.log_dir = $log' "$state_file" > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
 
     local fs_flag=""
     if [[ "$fullscreen" == true ]]; then
         fs_flag="--full-screen"
     fi
 
-    # The run command: cd to worktree and run wt-loop run with tee for logging.
-    # NOTE: We intentionally do NOT use `script` here. `script` creates a PTY that
-    # makes Claude think it's in interactive mode, preventing it from exiting after
-    # processing piped input. The terminal emulator already provides a TTY for the
-    # parent shell; Claude's stdin comes from a pipe (echo | claude) which properly
-    # closes on EOF without `script` interference.
-    local run_cmd="cd \"$wt_path\" && \"$SCRIPT_DIR/wt-loop\" run 2>&1 | tee \"$log_file\""
+    # The run command: cd to worktree and run wt-loop run.
+    # Per-iteration logging is handled inside cmd_run() using script(1) PTY wrapper.
+    local run_cmd="cd \"$wt_path\" && \"$SCRIPT_DIR/wt-loop\" run"
 
     if [[ "$(uname)" == "Darwin" ]]; then
         # macOS: Use Terminal.app via osascript
@@ -1154,7 +1736,7 @@ cmd_start() {
         cat > "$temp_script" << SCRIPT
 #!/bin/bash
 cd "$wt_path"
-"$SCRIPT_DIR/wt-loop" run 2>&1 | tee "$log_file"
+"$SCRIPT_DIR/wt-loop" run
 SCRIPT
         chmod +x "$temp_script"
         # Launch in Terminal.app with auto-close
@@ -1204,6 +1786,7 @@ APPLESCRIPT
     echo "  Max iterations: $max_iter"
     echo "  Done criteria: $done_criteria"
     echo "  Stall threshold: $stall_threshold"
+    echo "  Idle threshold: $max_idle_iterations"
     echo "  Iteration timeout: ${iteration_timeout}m"
     echo ""
     echo "Commands:"
@@ -1310,6 +1893,7 @@ cmd_status() {
         stuck) status_icon="⚠️" ;;
         stalled) status_icon="❓" ;;
         stopped) status_icon="⏹️" ;;
+        waiting:human) status_icon="⏸" ;;
         *) status_icon="❓" ;;
     esac
 
@@ -1317,6 +1901,21 @@ cmd_status() {
     echo "  Iteration: $iteration / $max_iter"
     echo "  Task: ${task:0:50}..."
     echo "  Started: $started"
+
+    # Show manual task info when waiting for human
+    if [[ "$status" == "waiting:human" ]]; then
+        local manual_count
+        manual_count=$(jq -r '.manual_tasks | length // 0' "$state_file" 2>/dev/null)
+        if [[ "$manual_count" -gt 0 ]]; then
+            echo ""
+            echo "  ⏸ Manual tasks pending ($manual_count):"
+            jq -r '.manual_tasks[]? | "    - [\(.id)] \(.description) (\(.type)\(if .input_key != "" then ":" + .input_key else "" end))"' "$state_file" 2>/dev/null
+            echo ""
+            local wt_name
+            wt_name=$(jq -r '.worktree_name // empty' "$state_file")
+            echo "  Run: wt-manual show ${wt_name:-$(basename "$(pwd)")}"
+        fi
+    fi
 
     # Show token usage if available
     local total_tokens
@@ -1544,6 +2143,64 @@ cmd_history() {
 }
 
 # Main
+# Resume a paused loop (waiting:budget or waiting:human → running)
+cmd_resume() {
+    local wt_path
+    wt_path=$(get_worktree_path_from_cwd)
+    local worktree_name
+    worktree_name=$(basename "$wt_path")
+
+    local state_file
+    state_file=$(get_loop_state_file "$wt_path")
+
+    if [[ ! -f "$state_file" ]]; then
+        error "No loop found in: $worktree_name"
+        exit 1
+    fi
+
+    local current_status
+    current_status=$(jq -r '.status' "$state_file" 2>/dev/null)
+
+    case "$current_status" in
+        waiting:budget|waiting:human)
+            update_loop_state "$state_file" "status" '"running"'
+            success "Loop resumed: $worktree_name (was $current_status)"
+            ;;
+        *)
+            error "Cannot resume: loop status is '$current_status' (expected waiting:budget or waiting:human)"
+            exit 1
+            ;;
+    esac
+}
+
+# Update token budget for a running/paused loop
+cmd_budget() {
+    local wt_path
+    wt_path=$(get_worktree_path_from_cwd)
+    local worktree_name
+    worktree_name=$(basename "$wt_path")
+
+    local state_file
+    state_file=$(get_loop_state_file "$wt_path")
+
+    if [[ ! -f "$state_file" ]]; then
+        error "No loop found in: $worktree_name"
+        exit 1
+    fi
+
+    local new_budget_k="${1:-}"
+    if [[ -z "$new_budget_k" ]] || ! [[ "$new_budget_k" =~ ^[0-9]+$ ]]; then
+        error "Usage: wt-loop budget <N> (budget in thousands of tokens)"
+        exit 1
+    fi
+
+    local new_budget_raw=$((new_budget_k * 1000))
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson b "$new_budget_raw" '.token_budget = $b | .status = "running"' "$state_file" > "$tmp" && mv "$tmp" "$state_file"
+    success "Budget updated to ${new_budget_k}K and loop resumed: $worktree_name"
+}
+
 main() {
     local cmd="${1:-}"
     shift || true
@@ -1554,6 +2211,12 @@ main() {
             ;;
         stop)
             cmd_stop "$@"
+            ;;
+        resume)
+            cmd_resume "$@"
+            ;;
+        budget)
+            cmd_budget "$@"
             ;;
         status)
             cmd_status "$@"

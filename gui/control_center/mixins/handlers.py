@@ -323,29 +323,162 @@ class HandlersMixin:
             except Exception:
                 pass
 
-    def show_set_session_key(self):
-        """Show dialog to paste Claude session key"""
-        from ...constants import CONFIG_DIR, CLAUDE_SESSION_FILE
+    def _auto_scan_chrome(self):
+        """Auto-scan Chrome sessions on startup (silent — no dialogs)."""
+        from ...workers.chrome_cookies import is_pycookiecheat_available, ChromeScanWorker
+        from ...workers.usage import load_accounts
+
+        if not is_pycookiecheat_available():
+            logger.info("auto-scan: pycookiecheat not available")
+            return
+
+        if hasattr(self, '_chrome_scan_worker') and self._chrome_scan_worker.isRunning():
+            logger.debug("auto-scan: scan already in progress")
+            return
+
+        existing = load_accounts()
+        self._chrome_scan_worker = ChromeScanWorker(force_refresh=False, existing_accounts=existing)
+        self._chrome_scan_worker.scan_finished.connect(self._on_auto_scan_finished)
+        self._chrome_scan_worker.scan_error.connect(self._on_auto_scan_error)
+        self._chrome_scan_worker.start()
+
+    @log_exceptions
+    def _on_auto_scan_finished(self, sessions):
+        """Handle auto-scan results (silent)."""
+        from ...workers.chrome_cookies import merge_scan_results
+        from ...workers.usage import load_accounts, save_accounts
+
+        if not sessions:
+            logger.info("auto-scan: no sessions found")
+            return
+
+        logger.info("auto-scan: found %d sessions", len(sessions))
+        try:
+            existing = load_accounts()
+            merged = merge_scan_results(sessions, existing)
+            save_accounts(merged)
+        except Exception as e:
+            logger.warning("auto-scan: save failed: %s", e)
+            return
+
+        self._restart_usage_worker()
+
+    @log_exceptions
+    def _on_auto_scan_error(self, error_msg):
+        """Handle auto-scan error (silent)."""
+        logger.warning("auto-scan: scan failed: %s", error_msg)
+
+    def on_scan_chrome_sessions(self):
+        """Scan Chrome profiles for Claude session cookies and update accounts."""
+        from ...workers.chrome_cookies import is_pycookiecheat_available, ChromeScanWorker
+        from ...workers.usage import load_accounts
+
+        if not is_pycookiecheat_available():
+            show_warning(
+                self, "Missing Dependency",
+                "pycookiecheat is not installed.\n\n"
+                "Install it with:\n"
+                "  pip install pycookiecheat"
+            )
+            return
+
+        if hasattr(self, '_chrome_scan_worker') and self._chrome_scan_worker.isRunning():
+            logger.debug("manual-scan: scan already in progress")
+            return
+
+        existing = load_accounts()
+        self._chrome_scan_worker = ChromeScanWorker(force_refresh=True, existing_accounts=existing)
+        self._chrome_scan_worker.scan_finished.connect(self._on_manual_scan_finished)
+        self._chrome_scan_worker.scan_error.connect(self._on_manual_scan_error)
+        self._chrome_scan_worker.start()
+
+    @log_exceptions
+    def _on_manual_scan_finished(self, sessions):
+        """Handle manual scan results (show dialog)."""
+        from ...workers.chrome_cookies import merge_scan_results
+        from ...workers.usage import load_accounts, save_accounts
+
+        if not sessions:
+            show_information(
+                self, "Scan Chrome Sessions",
+                "No Chrome profiles with Claude sessions found."
+            )
+            return
+
+        names = [s["name"] for s in sessions]
+        try:
+            existing = load_accounts()
+            merged = merge_scan_results(sessions, existing)
+            save_accounts(merged)
+        except Exception as e:
+            show_warning(self, "Error", f"Failed to save accounts: {e}")
+            return
+
+        self._restart_usage_worker()
+        show_information(
+            self, "Scan Chrome Sessions",
+            f"Found {len(sessions)} account(s):\n" + "\n".join(f"  - {n}" for n in names)
+        )
+
+    @log_exceptions
+    def _on_manual_scan_error(self, error_msg):
+        """Handle manual scan error (show dialog)."""
+        show_warning(self, "Scan Error", f"Failed to scan Chrome sessions: {error_msg}")
+
+    def show_add_account(self):
+        """Show dialog to add a new Claude account"""
+        from ...workers.usage import load_accounts, save_accounts
 
         self.hide()
-        text, ok = get_text(
-            self, "Set Session Key",
-            "Paste your Claude sessionKey from browser DevTools\n"
-            "(F12 → Application → Cookies → claude.ai → sessionKey):",
+        name, ok = get_text(
+            self, "Add Account",
+            "Account name (e.g. Personal, Work):",
         )
-        if ok and text.strip():
-            session_key = text.strip()
-            # Save to file
+        if not ok or not name.strip():
+            self.show_window()
+            return
+
+        key, ok2 = get_text(
+            self, "Add Account",
+            f"Session key for '{name.strip()}':\n"
+            "(F12 → Application → Cookies → claude.ai → sessionKey)",
+        )
+        if ok2 and key.strip():
+            accounts = load_accounts()
+            accounts.append({"name": name.strip(), "sessionKey": key.strip(), "source": "manual"})
             try:
-                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                with open(CLAUDE_SESSION_FILE, "w") as f:
-                    json.dump({"sessionKey": session_key}, f)
+                save_accounts(accounts)
             except Exception as e:
-                show_warning(self, "Error", f"Failed to save session key: {e}")
+                show_warning(self, "Error", f"Failed to save account: {e}")
                 self.show_window()
                 return
+            self._restart_usage_worker()
+        self.show_window()
 
-            # Test the key by restarting usage worker
+    def show_remove_account(self):
+        """Show dialog to remove a Claude account"""
+        from ...workers.usage import load_accounts, save_accounts
+        from ...dialogs.helpers import get_item
+
+        accounts = load_accounts()
+        if len(accounts) <= 1:
+            return
+
+        names = [a["name"] for a in accounts]
+        self.hide()
+        chosen, ok = get_item(
+            self, "Remove Account",
+            "Select account to remove:",
+            names, 0, False,
+        )
+        if ok and chosen:
+            accounts = [a for a in accounts if a["name"] != chosen]
+            try:
+                save_accounts(accounts)
+            except Exception as e:
+                show_warning(self, "Error", f"Failed to remove account: {e}")
+                self.show_window()
+                return
             self._restart_usage_worker()
         self.show_window()
 
