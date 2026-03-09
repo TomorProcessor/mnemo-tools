@@ -56,6 +56,11 @@ class UsageData:
     per_model: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
     @property
+    def api_tokens(self) -> int:
+        """Tokens sent/received (input + output only, excludes cache)"""
+        return self.input_tokens + self.output_tokens
+
+    @property
     def total_tokens(self) -> int:
         """Total tokens including cache operations"""
         return (
@@ -109,29 +114,40 @@ class UsageData:
 class UsageCalculator:
     """Calculate token usage from local Claude JSONL files"""
 
-    def __init__(self, claude_dir: Optional[Path] = None):
+    def __init__(self, claude_dir: Optional[Path] = None, project_dir: Optional[str] = None):
         """
         Initialize calculator.
 
         Args:
             claude_dir: Path to Claude config directory. Defaults to ~/.claude/
+            project_dir: Optional project directory name to filter by.
+                When set, only JSONL files from ~/.claude/projects/<project_dir>/ are scanned.
         """
         self.claude_dir = claude_dir or Path.home() / ".claude"
+        self.project_dir = project_dir
 
     def get_projects_dir(self) -> Path:
         """Get the projects directory path"""
         return self.claude_dir / "projects"
 
     def iter_jsonl_files(self):
-        """Iterate over all JSONL files in projects directory"""
+        """Iterate over all JSONL files in projects directory (recursive, includes subagent sessions)"""
         projects_dir = self.get_projects_dir()
         if not projects_dir.exists():
             return
 
-        for session_dir in projects_dir.iterdir():
-            if session_dir.is_dir():
-                for jsonl_file in session_dir.glob("*.jsonl"):
+        if self.project_dir:
+            # Scoped: only scan the specific project directory
+            scoped_dir = projects_dir / self.project_dir
+            if scoped_dir.is_dir():
+                for jsonl_file in scoped_dir.rglob("*.jsonl"):
                     yield jsonl_file
+        else:
+            # Unfiltered: scan all project directories
+            for session_dir in projects_dir.iterdir():
+                if session_dir.is_dir():
+                    for jsonl_file in session_dir.rglob("*.jsonl"):
+                        yield jsonl_file
 
     def parse_usage_line(self, line: str) -> Tuple[Optional[UsageData], Optional[datetime], Optional[str]]:
         """
@@ -215,9 +231,16 @@ class UsageCalculator:
                         if usage is None or timestamp is None:
                             continue
 
-                        # Filter by time window
-                        if since is not None and timestamp < since:
-                            continue
+                        # Filter by time window (handle naive/aware mismatch)
+                        if since is not None:
+                            cmp_ts = timestamp
+                            cmp_since = since
+                            if cmp_ts.tzinfo is not None and cmp_since.tzinfo is None:
+                                cmp_ts = cmp_ts.replace(tzinfo=None)
+                            elif cmp_ts.tzinfo is None and cmp_since.tzinfo is not None:
+                                cmp_since = cmp_since.replace(tzinfo=None)
+                            if cmp_ts < cmp_since:
+                                continue
 
                         total = total + usage
 
@@ -251,7 +274,7 @@ class UsageCalculator:
         """
         if limit <= 0:
             return 0.0
-        return (usage.total_tokens / limit) * 100
+        return (usage.api_tokens / limit) * 100
 
     def get_usage_summary(
         self,
@@ -279,11 +302,11 @@ class UsageCalculator:
             "session_pct": session_pct,
             "session_reset": None,  # No reset time available from local data
             "session_burn": None,   # Can't calculate burn rate without reset time
-            "session_tokens": usage_5h.total_tokens,
+            "session_tokens": usage_5h.api_tokens,
             "weekly_pct": weekly_pct,
             "weekly_reset": None,
             "weekly_burn": None,
-            "weekly_tokens": usage_weekly.total_tokens,
+            "weekly_tokens": usage_weekly.api_tokens,
             "estimated_cost_usd": usage_weekly.estimate_cost(),
             "source": "local",
             "is_estimated": True,

@@ -15,12 +15,27 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Add project root to path for imports
-script_dir = Path(__file__).parent
+# Add project root to path for imports (resolve symlinks so ~/.local/bin/wt-usage → wt-tools/bin/)
+script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
 sys.path.insert(0, str(project_root))
 
-from gui.usage_calculator import UsageCalculator, UsageData
+try:
+    # Import directly to avoid gui/__init__.py pulling in PySide6 (not needed for CLI)
+    from gui.usage_calculator import UsageCalculator, UsageData
+except ImportError:
+    # Fallback: import the module file directly, bypassing gui package init
+    import importlib.util
+    uc_path = project_root / "gui" / "usage_calculator.py"
+    if uc_path.exists():
+        spec = importlib.util.spec_from_file_location("usage_calculator", uc_path)
+        uc_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(uc_mod)
+        UsageCalculator = uc_mod.UsageCalculator
+        UsageData = uc_mod.UsageData
+    else:
+        print(json.dumps({"error": "usage_calculator not found", "total_tokens": 0}))
+        sys.exit(1)
 
 CONFIG_DIR = Path.home() / ".config" / "wt-tools"
 SESSION_FILE = CONFIG_DIR / "claude-session.json"
@@ -199,6 +214,7 @@ def main():
     time_group.add_argument("--week", action="store_true", help="Last 7 days")
     time_group.add_argument("--month", action="store_true", help="Last 30 days")
 
+    parser.add_argument("--project-dir", help="Only count tokens from this project directory name")
     parser.add_argument("--cost", action="store_true", help="Include estimated USD cost")
     parser.add_argument("--login", action="store_true", help="Set session key for exact API data")
 
@@ -208,7 +224,7 @@ def main():
         do_login()
         return
 
-    calc = UsageCalculator()
+    calc = UsageCalculator(project_dir=getattr(args, 'project_dir', None))
     usage, period = get_usage(calc, args)
 
     if args.format == "json":
@@ -218,6 +234,7 @@ def main():
             "output_tokens": usage.output_tokens,
             "cache_read_tokens": usage.cache_read_tokens,
             "cache_creation_tokens": usage.cache_creation_tokens,
+            "api_tokens": usage.api_tokens,
             "total_tokens": usage.total_tokens,
         }
         if args.cost:
@@ -240,7 +257,8 @@ def main():
         print(f"  Output tokens:    {usage.output_tokens:>12,}")
         print(f"  Cache read:       {usage.cache_read_tokens:>12,}")
         print(f"  Cache creation:   {usage.cache_creation_tokens:>12,}")
-        print(f"  Total:            {usage.total_tokens:>12,}")
+        print(f"  API (in+out):     {usage.api_tokens:>12,}")
+        print(f"  Total (w/cache):  {usage.total_tokens:>12,}")
 
         if args.cost:
             cost = usage.estimate_cost()

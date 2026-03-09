@@ -57,6 +57,21 @@ def format_tokens(n):
     return str(n)
 
 
+def format_token_breakdown(change):
+    """Format token breakdown: in/out (cache) for a change."""
+    inp = change.get("input_tokens") or 0
+    out = change.get("output_tokens") or 0
+    cache_read = change.get("cache_read_tokens") or 0
+    cache_create = change.get("cache_create_tokens") or 0
+    total = change.get("tokens_used") or 0
+    if total == 0:
+        return "-"
+    cache = cache_read + cache_create
+    if cache > 0:
+        return f"{format_tokens(inp)}/{format_tokens(out)} [dim]c:{format_tokens(cache)}[/]"
+    return f"{format_tokens(inp)}/{format_tokens(out)}"
+
+
 def format_duration(seconds):
     """Format seconds as human-readable duration."""
     if seconds is None or seconds <= 0:
@@ -134,7 +149,7 @@ class StateReader:
         try:
             with open(loop_file) as f:
                 ls = json.load(f)
-            iteration = ls.get("iteration", 0)
+            iteration = ls.get("current_iteration", 0)
             max_iter = ls.get("max_iterations", 0)
             if max_iter > 0:
                 return f"{iteration}/{max_iter}"
@@ -254,7 +269,7 @@ class OrchestratorTUI(App):
     def on_mount(self) -> None:
         # Set up table columns
         table = self.query_one("#change-table", DataTable)
-        table.add_columns("Name", "Status", "Iter", "Tokens", "Gates")
+        table.add_columns("Name", "Status", "Iter", "In/Out (Cache)", "Gates")
         table.cursor_type = "row"
 
         # Initial data load
@@ -292,6 +307,7 @@ class OrchestratorTUI(App):
         color, icon = STATUS_DISPLAY.get(orch_status, ("white", "?"))
         plan_version = state.get("plan_version", "?")
         replan_cycle = state.get("replan_cycle", 0)
+        project_name = self.reader.state_path.parent.name
 
         # Progress counts
         changes = state.get("changes", [])
@@ -306,6 +322,12 @@ class OrchestratorTUI(App):
             total_tokens = prev_tokens
         else:
             total_tokens = current_tokens + prev_tokens
+
+        # Cache breakdown across all changes
+        total_cache_read = sum(c.get("cache_read_tokens", 0) or 0 for c in changes)
+        total_cache_create = sum(c.get("cache_create_tokens", 0) or 0 for c in changes)
+        total_input = sum(c.get("input_tokens", 0) or 0 for c in changes)
+        total_output = sum(c.get("output_tokens", 0) or 0 for c in changes)
 
         # Time tracking
         active_secs = state.get("active_seconds", 0) or 0
@@ -333,8 +355,19 @@ class OrchestratorTUI(App):
                 time_text += f" / {format_duration(time_limit)} limit [red](exceeded)[/]"
 
         # Compose header
-        line1 = f"  {status_text}  {plan_text}  {done}/{total} done  Tokens: {format_tokens(total_tokens)}"
-        line2 = f"  {time_text}"
+        if prev_tokens > 0 and current_tokens > 0:
+            token_text = f"Tokens: {format_tokens(current_tokens)} (plan) / {format_tokens(total_tokens)} all"
+        else:
+            token_text = f"Tokens: {format_tokens(total_tokens)}"
+
+        # Cache detail line
+        if total_cache_read > 0 or total_cache_create > 0:
+            cache_text = f"  in:{format_tokens(total_input)} out:{format_tokens(total_output)} [dim]cache_r:{format_tokens(total_cache_read)} cache_w:{format_tokens(total_cache_create)}[/]"
+        else:
+            cache_text = ""
+
+        line1 = f"  [bold]{project_name}[/]  {status_text}  {plan_text}  {done}/{total} done  {token_text}"
+        line2 = f"  {time_text}{cache_text}"
 
         # Extra note for time_limit status
         if orch_status == "time_limit":
@@ -363,10 +396,10 @@ class OrchestratorTUI(App):
             if deps and status in ("pending", "dispatched"):
                 dep_text = ", ".join(d[:12] for d in deps[:2])
                 name_display = f"{name[:22]} [dim](→{dep_text})[/]"
+            elif len(name) > 25:
+                name_display = name[:24] + "…"
             else:
                 name_display = name
-            if len(name) > 25:
-                name = name[:24] + "…"
             color, icon = STATUS_DISPLAY.get(status, ("white", "?"))
             status_cell = f"[{color}]{icon} {status}[/]"
 
@@ -374,7 +407,7 @@ class OrchestratorTUI(App):
             wt_path = change.get("worktree_path")
             iteration = self.reader.read_loop_state(wt_path) if status == "running" else "-"
 
-            tokens = format_tokens(change.get("tokens_used"))
+            tokens = format_token_breakdown(change)
 
             # Gates (only show for non-pending)
             if status in ("pending", "dispatched"):

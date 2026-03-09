@@ -12,6 +12,136 @@ while [[ -L "$_wt_project_script" ]]; do
 done
 WT_TOOLS_ROOT="$(cd "$(dirname "$_wt_project_script")/.." && pwd)"
 
+# Source deploy functions from lib/project/
+source "$WT_TOOLS_ROOT/lib/project/deploy.sh"
+
+# Get wt-tools version (git short hash or tag)
+_get_wt_tools_version() {
+    local version=""
+    if [[ -d "$WT_TOOLS_ROOT/.git" ]] || git -C "$WT_TOOLS_ROOT" rev-parse --git-dir &>/dev/null; then
+        # Prefer tag if on a tagged commit
+        version=$(git -C "$WT_TOOLS_ROOT" describe --tags --exact-match 2>/dev/null || true)
+        if [[ -z "$version" ]]; then
+            version=$(git -C "$WT_TOOLS_ROOT" rev-parse --short HEAD 2>/dev/null || true)
+        fi
+    fi
+    echo "${version:-unknown}"
+}
+
+# Find a Python 3 interpreter that has wt-project-base installed.
+# Tries: miniconda, uv-managed, system python3 — returns first that works.
+_wt_python() {
+    local candidates=(
+        "$HOME/miniconda3/bin/python"
+        "$HOME/.local/share/uv/python/cpython-*/bin/python3"
+        "$(command -v python3 2>/dev/null)"
+        "$(command -v python 2>/dev/null)"
+    )
+    for py in "${candidates[@]}"; do
+        [[ -z "$py" ]] && continue
+        # Expand globs
+        for resolved in $py; do
+            [[ -x "$resolved" ]] || continue
+            if "$resolved" -c "import wt_project_base" 2>/dev/null; then
+                echo "$resolved"
+                return 0
+            fi
+        done
+    done
+    # Fallback to plain python3 even if package not installed
+    echo "python3"
+}
+
+# Known orchestration directives with defaults (for migration additive merge)
+_KNOWN_DIRECTIVES='{"max_parallel":2,"default_model":"opus","time_limit":"","checkpoint_interval":5,"smoke_command":"","smoke_timeout":120,"smoke_blocking":true,"test_command":"","build_command":"","review_model":"","events_log":"","events_max_size":"","watchdog_timeout":"","watchdog_loop_threshold":"","max_tokens_per_change":"","context_pruning":true,"plan_approval":false,"model_routing":"off"}'
+
+# Migrate consumer project on version change — additive only, never overwrites.
+# Usage: _migrate_consumer <project-path> <old-version> <new-version>
+_migrate_consumer() {
+    local project_path="$1"
+    local old_ver="$2"
+    local new_ver="$3"
+    local added_directives=0
+    local created_files=0
+
+    # 1. Additive directive merge for orchestration.yaml (check wt/ first)
+    local orch_yaml="$project_path/wt/orchestration/config.yaml"
+    if [[ ! -f "$orch_yaml" ]]; then
+        orch_yaml="$project_path/.claude/orchestration.yaml"
+    fi
+    if [[ -f "$orch_yaml" ]]; then
+        # Find directives in our known set that are missing from consumer's yaml
+        local existing_keys
+        existing_keys=$(grep -E '^[a-z_]+:' "$orch_yaml" 2>/dev/null | sed 's/:.*//' | tr '\n' '|' || true)
+
+        if [[ -n "$existing_keys" ]]; then
+            # Check each known directive
+            local all_keys
+            all_keys=$(echo "$_KNOWN_DIRECTIVES" | jq -r 'keys[]')
+            while IFS= read -r key; do
+                [[ -z "$key" ]] && continue
+                if ! echo "$existing_keys" | grep -q "${key}|"; then
+                    # Missing directive — add with comment
+                    local default_val
+                    default_val=$(echo "$_KNOWN_DIRECTIVES" | jq -r --arg k "$key" '.[$k] // ""')
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        info "  Would add directive: $key: $default_val"
+                    else
+                        echo "# $key: $default_val  # added by migration $old_ver → $new_ver" >> "$orch_yaml"
+                    fi
+                    added_directives=$((added_directives + 1))
+                fi
+            done <<< "$all_keys"
+        fi
+    fi
+
+    # 2. Scaffold project-knowledge.yaml if missing
+    local pk_file="$project_path/project-knowledge.yaml"
+    if [[ ! -f "$pk_file" && -f "$WT_TOOLS_ROOT/templates/project-knowledge.yaml" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "  Would scaffold project-knowledge.yaml"
+        else
+            # Don't auto-create — just inform. Use init-knowledge for proper scaffolding
+            info "  project-knowledge.yaml missing — run 'wt-project init-knowledge' to scaffold"
+        fi
+        created_files=$((created_files + 1))
+    fi
+
+    # 3. Deploy cross-cutting checklist if missing
+    local checklist_dst="$project_path/.claude/rules/cross-cutting-checklist.md"
+    if [[ ! -f "$checklist_dst" && -f "$WT_TOOLS_ROOT/templates/cross-cutting-checklist.md" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "  Would deploy cross-cutting-checklist.md"
+        else
+            mkdir -p "$(dirname "$checklist_dst")"
+            cp "$WT_TOOLS_ROOT/templates/cross-cutting-checklist.md" "$checklist_dst"
+        fi
+        created_files=$((created_files + 1))
+    fi
+
+    # 4. Warn about unknown or deprecated directives
+    if [[ -f "$orch_yaml" ]]; then
+        local consumer_keys
+        consumer_keys=$(grep -E '^[a-z_]+:' "$orch_yaml" 2>/dev/null | sed 's/:.*//' || true)
+        local known_keys
+        known_keys=$(echo "$_KNOWN_DIRECTIVES" | jq -r 'keys[]')
+        # Also allow hook_* directives
+        while IFS= read -r ckey; do
+            [[ -z "$ckey" ]] && continue
+            [[ "$ckey" == hook_* ]] && continue  # hook_* are valid
+            if ! echo "$known_keys" | grep -qx "$ckey"; then
+                warn "  Unknown directive in orchestration.yaml: $ckey"
+            fi
+        done <<< "$consumer_keys"
+    fi
+
+    if [[ $added_directives -gt 0 || $created_files -gt 0 ]]; then
+        local verb="Updated"
+        [[ "$DRY_RUN" == "true" ]] && verb="Would update"
+        info "  $verb from $old_ver to $new_ver: added $added_directives directive(s), created $created_files file(s)"
+    fi
+}
+
 # Deploy wt-tools hooks, commands, and skills to a project's .claude/ directory.
 # Usage: deploy_wt_tools <project-path> [<extra-mcp-path> ...]
 # extra-mcp-path: additional paths to register MCP for (e.g. current worktree)
@@ -21,324 +151,287 @@ deploy_wt_tools() {
     local claude_dir="$project_path/.claude"
     local _warnings=0
 
-    # 1. Deploy hooks via wt-deploy-hooks
-    if "$SCRIPT_DIR/wt-deploy-hooks" --quiet "$project_path"; then
-        success "  Deployed hooks to .claude/settings.json"
-    else
-        warn "  Failed to deploy hooks to .claude/settings.json"
-        ((_warnings++))
+    # 0. Version tracking — store wt-tools version in consumer project
+    local current_version
+    current_version=$(_get_wt_tools_version)
+    local version_file="$claude_dir/.wt-version"
+    local old_version=""
+    if [[ -f "$version_file" ]]; then
+        old_version=$(cat "$version_file" 2>/dev/null || true)
     fi
-
-    # 2. Deploy /wt:* commands (copy)
-    local src_commands="$WT_TOOLS_ROOT/.claude/commands/wt"
-    local dst_commands="$claude_dir/commands/wt"
-    if [[ -d "$src_commands" ]]; then
-        # Replace symlink with directory if needed
-        [[ -L "$dst_commands" ]] && rm -f "$dst_commands"
-        mkdir -p "$dst_commands"
-        if [[ "$(realpath "$src_commands")" != "$(realpath "$dst_commands")" ]]; then
-            cp -r "$src_commands"/* "$dst_commands/"
+    mkdir -p "$claude_dir"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if [[ -n "$old_version" && "$old_version" != "$current_version" ]]; then
+            info "  Would update wt-tools: $old_version → $current_version"
+            _migrate_consumer "$project_path" "$old_version" "$current_version"
+        elif [[ -z "$old_version" ]]; then
+            info "  Would write version: $current_version"
         fi
-        local cmd_count
-        cmd_count=$(ls -1 "$src_commands"/*.md 2>/dev/null | wc -l)
-        success "  Deployed $cmd_count command(s) to .claude/commands/wt/"
-    else
-        warn "  Source commands not found: $src_commands"
+        return 0
+    fi
+    echo "$current_version" > "$version_file"
+    if [[ -n "$old_version" && "$old_version" != "$current_version" ]]; then
+        info "  wt-tools updated: $old_version → $current_version"
+        _migrate_consumer "$project_path" "$old_version" "$current_version"
     fi
 
-    # 2b. Deploy /opsx:* commands (copy)
-    local src_opsx_commands="$WT_TOOLS_ROOT/.claude/commands/opsx"
-    local dst_opsx_commands="$claude_dir/commands/opsx"
-    if [[ -d "$src_opsx_commands" ]]; then
-        [[ -L "$dst_opsx_commands" ]] && rm -f "$dst_opsx_commands"
-        mkdir -p "$dst_opsx_commands"
-        if [[ "$(realpath "$src_opsx_commands")" != "$(realpath "$dst_opsx_commands")" ]]; then
-            cp -r "$src_opsx_commands"/* "$dst_opsx_commands/"
-        fi
-        local opsx_cmd_count
-        opsx_cmd_count=$(ls -1 "$src_opsx_commands"/*.md 2>/dev/null | wc -l)
-        success "  Deployed $opsx_cmd_count command(s) to .claude/commands/opsx/"
-    fi
-
-    # 3. Deploy wt skills (copy)
-    local src_skills="$WT_TOOLS_ROOT/.claude/skills/wt"
-    local dst_skills="$claude_dir/skills/wt"
-    if [[ -d "$src_skills" ]]; then
-        [[ -L "$dst_skills" ]] && rm -f "$dst_skills"
-        mkdir -p "$dst_skills"
-        if [[ "$(realpath "$src_skills")" != "$(realpath "$dst_skills")" ]]; then
-            cp -r "$src_skills"/* "$dst_skills/"
-        fi
-        success "  Deployed skills to .claude/skills/wt/"
-    else
-        warn "  Source skills not found: $src_skills"
-    fi
-
-    # 3a-ii. Deploy openspec-* skills (copy each)
-    local openspec_skill_count=0
-    for src_skill_dir in "$WT_TOOLS_ROOT/.claude/skills"/openspec-*/; do
-        [[ -d "$src_skill_dir" ]] || continue
-        local skill_name
-        skill_name=$(basename "$src_skill_dir")
-        local dst_skill_dir="$claude_dir/skills/$skill_name"
-        [[ -L "$dst_skill_dir" ]] && rm -f "$dst_skill_dir"
-        mkdir -p "$dst_skill_dir"
-        if [[ "$(realpath "$src_skill_dir")" != "$(realpath "$dst_skill_dir")" ]]; then
-            cp -r "$src_skill_dir"/* "$dst_skill_dir/"
-            openspec_skill_count=$((openspec_skill_count + 1))
-        fi
-    done
-    if [[ $openspec_skill_count -gt 0 ]]; then
-        success "  Deployed $openspec_skill_count openspec skill(s) to .claude/skills/"
-    fi
-
-    # 3b. Deploy rules (path-scoped project rules)
-    local src_rules="$WT_TOOLS_ROOT/.claude/rules"
-    local dst_rules="$claude_dir/rules"
-    if [[ -d "$src_rules" ]]; then
-        local is_self=false
-        if [[ -d "$dst_rules" ]] && [[ "$(realpath "$src_rules")" == "$(realpath "$dst_rules")" ]]; then
-            is_self=true
-        fi
-        if [[ "$is_self" == "false" ]]; then
-            # Deploy with wt- prefix to avoid conflicts with project-specific rules
-            # Skip gui/ rules for non-wt-tools projects (only wt-tools has gui/)
-            local rule_count=0
-            while IFS= read -r -d '' src_file; do
-                local rel_path="${src_file#"$src_rules/"}"
-                local dir_part
-                dir_part=$(dirname "$rel_path")
-                # Skip gui/ rules — they're wt-tools-specific (path-scoped to gui/**)
-                [[ "$dir_part" == gui ]] && continue
-                local base_name
-                base_name=$(basename "$rel_path")
-                local dst_dir="$dst_rules"
-                [[ "$dir_part" != "." ]] && dst_dir="$dst_rules/$dir_part"
-                mkdir -p "$dst_dir"
-                cp "$src_file" "$dst_dir/wt-$base_name"
-                rule_count=$((rule_count + 1))
-            done < <(find "$src_rules" -name '*.md' -print0)
-            success "  Deployed $rule_count rule(s) to .claude/rules/ (wt-* prefix)"
-        else
-            success "  Rules: self-deploy detected, skipping"
-        fi
-    fi
-
-    # 3c. Deploy agents (copy)
-    local src_agents="$WT_TOOLS_ROOT/.claude/agents"
-    local dst_agents="$claude_dir/agents"
-    if [[ -d "$src_agents" ]]; then
-        [[ -L "$dst_agents" ]] && rm -f "$dst_agents"
-        mkdir -p "$dst_agents"
-        if [[ "$(realpath "$src_agents")" != "$(realpath "$dst_agents")" ]]; then
-            cp "$src_agents"/*.md "$dst_agents/" 2>/dev/null || true
-        fi
-        local agent_count
-        agent_count=$(ls -1 "$src_agents"/*.md 2>/dev/null | wc -l)
-        success "  Deployed $agent_count agent(s) to .claude/agents/"
-    fi
-
-    # 4. Remove deprecated inline memory hooks from OpenSpec skill/command files
-    if command -v wt-memory-hooks &>/dev/null; then
-        (cd "$project_path" && wt-memory-hooks remove --quiet) 2>/dev/null || true
-    fi
-
-    # 4b. Clean up deprecated memory references
-    _cleanup_deprecated_memory_refs "$project_path"
-
-    # 5. Ensure CLAUDE.md has the Persistent Memory section
-    local claude_md="$project_path/CLAUDE.md"
-    local memory_marker="## Persistent Memory"
-    local current_important='Start by summarizing what you already know from the injected memory, then fill in gaps.'
-    local correct_important='When you receive memory context, follow these steps:
-1. **Scan** system-reminder tags for "PROJECT MEMORY", "PROJECT CONTEXT", or "MEMORY: Context for this command"
-2. **Match** — check if any memory directly answers the user'"'"'s question or provides a known fix
-3. **Cite** — if a match is found, cite it: "From memory: ..." — do NOT re-investigate problems with known solutions
-4. **Proceed** — only after checking memory context, do independent research'
-    if [[ ! -f "$claude_md" ]] || ! grep -q "$memory_marker" "$claude_md" 2>/dev/null; then
-        local snippet
-        snippet=$(cat << 'MEMORY_SNIPPET'
-
-## Persistent Memory
-<!-- wt-tools:managed — DO NOT edit or remove this section. It is auto-generated by `wt-project init`. -->
-
-This project uses persistent memory (shodh-memory) across sessions. Memory context is automatically injected into `<system-reminder>` tags in your conversation — **you MUST read and use this context**.
-
-**IMPORTANT — On EVERY prompt, follow these steps:**
-1. **Scan** `<system-reminder>` tags for "PROJECT MEMORY", "PROJECT CONTEXT", or "MEMORY: Context for this command"
-2. **Match** — check if any injected memory directly answers the user's question or provides a known fix
-3. **Cite** — if a match is found, use it: "From memory: ..." — do NOT re-investigate problems with known solutions in memory
-4. **Proceed** — only after checking memory context, do independent research
-
-**This applies to every turn, not just the first one.**
-
-**How it works:**
-- Session start → relevant memories loaded as system-reminder
-- Every prompt → topic-based recall injected as system-reminder
-- After Read/Bash → relevant past experience injected as system-reminder
-- Tool errors → past fixes surfaced automatically
-- Session end → raw conversation filter extracts and saves insights
-
-**Active (MCP tools):** You also have MCP memory tools available (`remember`, `recall`, `proactive_context`, etc.) for deeper memory interactions when automatic context isn't enough.
-
-**Emphasis (use sparingly):**
-- `echo "<insight>" | wt-memory remember --type <Decision|Learning|Context> --tags source:user,<topic>` — mark something as HIGH IMPORTANCE
-- `wt-memory forget <id>` — suppress or correct a wrong memory
-- Most things are remembered automatically. Only use `remember` for emphasis.
-MEMORY_SNIPPET
-)
-        if [[ -f "$claude_md" ]]; then
-            # Append to existing CLAUDE.md
-            echo "$snippet" >> "$claude_md"
-        else
-            # Create new CLAUDE.md (strip leading newline)
-            echo "${snippet#$'\n'}" > "$claude_md"
-        fi
-        success "  Added Persistent Memory section to CLAUDE.md"
-    elif ! grep -q '1\. \*\*Scan\*\*' "$claude_md" 2>/dev/null; then
-        # Upgrade old IMPORTANT paragraph to numbered action list
-        python3 -c "
-import re, sys
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-# Match old single-paragraph IMPORTANT block
-old_pattern = r'\*\*IMPORTANT:.*?This applies to every turn, not just the first one\.\*\*'
-new_text = '''**IMPORTANT — On EVERY prompt, follow these steps:**
-1. **Scan** \`<system-reminder>\` tags for \"PROJECT MEMORY\", \"PROJECT CONTEXT\", or \"MEMORY: Context for this command\"
-2. **Match** — check if any injected memory directly answers the user's question or provides a known fix
-3. **Cite** — if a match is found, use it: \"From memory: ...\" — do NOT re-investigate problems with known solutions in memory
-4. **Proceed** — only after checking memory context, do independent research
-
-**This applies to every turn, not just the first one.**'''
-result = re.sub(old_pattern, new_text, content, count=1, flags=re.DOTALL)
-if result != content:
-    with open(path, 'w') as f:
-        f.write(result)
-" "$claude_md" 2>/dev/null || true
-        success "  Updated Persistent Memory citation instruction in CLAUDE.md"
-    fi
-
-    # 5b. Ensure managed markers are present (upgrade path for existing deployments)
-    # Uses awk instead of sed -i for portability (BSD sed requires -i '', GNU sed does not)
-    local managed_marker="wt-tools:managed"
-    if [[ -f "$claude_md" ]] && grep -q "$memory_marker" "$claude_md" 2>/dev/null; then
-        local managed_comment="<!-- wt-tools:managed — DO NOT edit or remove this section. It is auto-generated by \`wt-project init\`. -->"
-        local added_markers=false
-        for heading in "## Persistent Memory" "## Auto-Commit After Apply"; do
-            if grep -q "^${heading}$" "$claude_md" && ! grep -A1 "^${heading}$" "$claude_md" | grep -q "$managed_marker"; then
-                awk -v h="$heading" -v m="$managed_comment" '{print} $0 == h {print m}' "$claude_md" > "$claude_md.tmp" && mv "$claude_md.tmp" "$claude_md"
-                added_markers=true
-            fi
-        done
-        if [[ "$added_markers" == true ]]; then
-            success "  Added managed markers to CLAUDE.md sections"
-        fi
-    fi
-
-    # 6. Ensure CLAUDE.md has the Auto-Commit After Apply section
-    local commit_marker="## Auto-Commit After Apply"
-    if [[ -f "$claude_md" ]] && ! grep -q "$commit_marker" "$claude_md" 2>/dev/null; then
-        local commit_snippet
-        commit_snippet=$(cat << 'COMMIT_SNIPPET'
-
-## Auto-Commit After Apply
-<!-- wt-tools:managed — DO NOT edit or remove this section. It is auto-generated by `wt-project init`. -->
-
-After a skill-driven apply (e.g. `/opsx:apply`) finishes or pauses, automatically commit all changes. Follow the standard commit flow (stage relevant files, write a concise commit message).
-COMMIT_SNIPPET
-)
-        echo "$commit_snippet" >> "$claude_md"
-        success "  Added Auto-Commit After Apply section to CLAUDE.md"
-    fi
-
-    # 7. Register unified wt-tools MCP server for the project path (and any extra paths, e.g. worktree)
-    _register_mcp_server "$project_path" "$@" || ((_warnings++))
+    # Deploy each subsystem via focused functions (from lib/project/deploy.sh)
+    _deploy_hooks "$project_path" || ((_warnings++)) || true
+    _deploy_commands "$project_path"
+    _deploy_skills "$project_path"
+    _deploy_memory "$project_path"
+    scaffold_wt_directory "$project_path"
+    _deploy_mcp "$project_path" "$@" || ((_warnings++)) || true
 
     return $(( _warnings > 0 ? 1 : 0 ))
 }
 
 # Register the unified wt-tools MCP server scoped to one or more project paths.
-# Usage: _register_mcp_server <path> [<extra-path> ...]
-# claude mcp add uses PWD as the scope key, so we cd into each path before registering.
-# CLAUDE_PROJECT_DIR env var propagates project context to memory tools.
-_register_mcp_server() {
-    if ! command -v claude &>/dev/null; then
-        return 0  # claude CLI not available, skip
-    fi
-    local mcp_server_dir="$WT_TOOLS_ROOT/mcp-server"
-    [[ -d "$mcp_server_dir" ]] || return 0
-    local had_failure=0
-    for reg_path in "$@"; do
-        [[ -d "$reg_path" ]] || continue
-        # Remove old server names (may not exist — stderr suppressed intentionally)
-        (cd "$reg_path" && claude mcp remove wt-memory 2>/dev/null; claude mcp remove wt-tools 2>/dev/null) || true
-        # Register — capture errors, do NOT suppress stderr
-        local mcp_err
-        mcp_err=$(cd "$reg_path" && claude mcp add wt-tools -- env CLAUDE_PROJECT_DIR="$reg_path" uv --directory "$mcp_server_dir" run python wt_mcp_server.py 2>&1)
-        if [[ $? -ne 0 ]]; then
-            warn "  MCP registration failed for $reg_path: $mcp_err"
-            had_failure=1
-        fi
-    done
-    if [[ $had_failure -eq 0 ]]; then
-        success "  Registered wt-tools MCP server"
-    fi
-    return $had_failure
+# _register_mcp_server and _cleanup_deprecated_memory_refs moved to lib/project/deploy.sh
+
+# Resolve a project type name via Python entry points.
+# Prints JSON with info, rules, and directives.
+# Returns 1 if the project type is not found.
+_resolve_project_type() {
+    local type_name="$1"
+    local py
+    py=$(_wt_python)
+    "$py" -c "
+import json, sys
+try:
+    from importlib.metadata import entry_points
+except ImportError:
+    from importlib_metadata import entry_points
+
+try:
+    eps = entry_points(group='wt_tools.project_types')
+except TypeError:
+    eps = entry_points().get('wt_tools.project_types', [])
+
+for ep in eps:
+    if ep.name == '$type_name':
+        cls = ep.load()
+        pt = cls()
+        info = pt.info
+        rules = [{'id': r.id, 'description': r.description, 'check': r.check, 'severity': r.severity} for r in pt.get_verification_rules()]
+        directives = [{'id': d.id, 'description': d.description, 'trigger': d.trigger, 'action': d.action} for d in pt.get_orchestration_directives()]
+        print(json.dumps({'name': info.name, 'version': info.version, 'description': info.description, 'parent': info.parent, 'rules_count': len(rules), 'directives_count': len(directives)}))
+        sys.exit(0)
+
+print(json.dumps({'error': 'not_found'}), file=sys.stderr)
+sys.exit(1)
+" 2>/dev/null
 }
 
-# Clean up deprecated memory references from skill/command files
-_cleanup_deprecated_memory_refs() {
+# List available project types via Python entry points.
+_list_project_types() {
+    local py
+    py=$(_wt_python)
+    "$py" -c "
+import sys
+try:
+    from importlib.metadata import entry_points
+except ImportError:
+    from importlib_metadata import entry_points
+
+try:
+    eps = entry_points(group='wt_tools.project_types')
+except TypeError:
+    eps = entry_points().get('wt_tools.project_types', [])
+
+for ep in eps:
+    try:
+        cls = ep.load()
+        pt = cls()
+        info = pt.info
+        print(f'  {ep.name:12s} — {info.description}')
+    except Exception as e:
+        print(f'  {ep.name:12s} — (failed to load: {e})', file=sys.stderr)
+" 2>/dev/null
+}
+
+# Save project type to wt/plugins/project-type.yaml
+_save_project_type() {
     local project_path="$1"
+    local type_name="$2"
+    local init_template="${3:-}"
+    local init_modules="${4:-}"
+    local pt_file="$project_path/wt/plugins/project-type.yaml"
 
-    # Remove <!-- wt-memory hooks --> blocks from SKILL.md files
-    if [[ -d "$project_path/.claude/skills" ]]; then
-        find "$project_path/.claude/skills" -name "SKILL.md" -type f 2>/dev/null | while read -r f; do
-            if grep -q '<!-- wt-memory hooks' "$f" 2>/dev/null; then
-                if ! python3 -c "
-import re, sys
-with open(sys.argv[1]) as f:
-    content = f.read()
-# Remove all wt-memory hooks blocks (including variants like hooks-midflow, hooks-remember, etc.)
-cleaned = re.sub(r'<!--\s*wt-memory hooks[^>]*-->.*?<!--\s*/wt-memory hooks[^>]*-->\s*\n?', '', content, flags=re.DOTALL)
-if cleaned != content:
-    with open(sys.argv[1], 'w') as f:
-        f.write(cleaned)
-" "$f" 2>&1; then
-                    warn "  Failed to clean up memory hooks in $f"
-                fi
-            fi
-        done
+    # Validate project type exists
+    local pt_info
+    pt_info=$(_resolve_project_type "$type_name")
+    if [[ $? -ne 0 || -z "$pt_info" ]]; then
+        warn "  Project type '$type_name' not found. Available types:"
+        _list_project_types
+        return 1
     fi
 
-    # Remove manual wt-memory recall/remember instructions from command .md files
-    # Exclude commands/wt/ — those are wt-tools' own commands that legitimately use wt-memory
-    if [[ -d "$project_path/.claude/commands" ]]; then
-        find "$project_path/.claude/commands" -name "*.md" -type f 2>/dev/null | while read -r f; do
-            # Skip wt-tools command files (commands/wt/*.md) — they use wt-memory intentionally
-            [[ "$f" == */commands/wt/*.md ]] && continue
-            if grep -qE 'wt-memory (recall|remember)' "$f" 2>/dev/null; then
-                if ! python3 -c "
-import re, sys
-with open(sys.argv[1]) as f:
-    content = f.read()
-# Remove lines containing wt-memory recall or wt-memory remember instructions
-lines = content.split('\n')
-cleaned_lines = [l for l in lines if not re.search(r'wt-memory\s+(recall|remember)', l)]
-cleaned = '\n'.join(cleaned_lines)
-if cleaned != content:
-    with open(sys.argv[1], 'w') as f:
-        f.write(cleaned)
-" "$f" 2>&1; then
-                    warn "  Failed to clean up memory refs in $f"
-                fi
-            fi
-        done
+    local version description parent rules_count directives_count
+    version=$(echo "$pt_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('version',''))")
+    description=$(echo "$pt_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('description',''))")
+    parent=$(echo "$pt_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('parent','') or '')")
+    rules_count=$(echo "$pt_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('rules_count',0))")
+    directives_count=$(echo "$pt_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('directives_count',0))")
+
+    mkdir -p "$(dirname "$pt_file")"
+    cat > "$pt_file" << YAML
+# Project type configuration — managed by wt-project init
+# Change with: wt-project init --project-type <type>
+type: $type_name
+version: $version
+description: "$description"
+$([ -n "$parent" ] && echo "parent: $parent" || true)
+$([ -n "$init_template" ] && echo "template: $init_template" || true)
+$(if [ -n "$init_modules" ]; then echo "modules:"; IFS=',' read -ra _mods <<< "$init_modules"; for _m in "${_mods[@]}"; do [ -n "$_m" ] && echo "  - $_m"; done; fi)
+
+# Stats: ${rules_count} verification rules, ${directives_count} orchestration directives
+# Rules and directives are loaded dynamically from the installed package.
+# Use 'wt-project-base resolve --project-dir .' to see the merged final set.
+
+# ── Project Customizations ──────────────────────────────────────────
+# Add, disable, or override rules and directives below.
+# These sections are yours — wt-project init will not overwrite them.
+
+# Add custom verification rules (same format as package rules):
+# custom_rules:
+#   - id: my-custom-rule
+#     description: "Description of what this rule checks"
+#     check: pattern-absence    # check type
+#     severity: warning         # error, warning, info
+#     config:
+#       pattern: "src/**/*.ts"
+#       forbidden: "some-pattern"
+
+# Disable package rules that don't apply to this project:
+# disabled_rules:
+#   - ghost-button-text
+#   - todo-tracking
+
+# Override config of existing rules:
+# rule_overrides:
+#   file-size-limit:
+#     config:
+#       max_lines: 600
+
+# Add custom orchestration directives:
+# custom_directives:
+#   - id: run-custom-lint
+#     description: "Run custom linter after changes"
+#     trigger: 'change-modifies("src/**")'
+#     action: post-merge
+#     config: { command: "pnpm lint:custom" }
+
+# Disable package directives:
+# disabled_directives:
+#   - install-deps-python
+
+# For personal (non-shared) overrides, create .local-overrides.yaml
+# in this directory — it uses the same format and is gitignored.
+YAML
+
+    success "  Project type set to '$type_name' ($rules_count rules, $directives_count directives)"
+
+    # Also register in projects.json — look up by path, not basename
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local abs_path
+        abs_path=$(cd "$project_path" && pwd)
+        local tmp
+        tmp=$(mktemp)
+        jq --arg path "$abs_path" --arg pt "$type_name" \
+            '(.projects | to_entries[] | select(.value.path == $path)) as $e |
+             if $e then .projects[$e.key].project_type = $pt else . end' \
+            "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    fi
+}
+
+# Scaffold wt/ directory structure in a project.
+# Creates all standard subdirectories. Idempotent — safe to re-run.
+scaffold_wt_directory() {
+    local project_path="$1"
+    local wt_dir="$project_path/wt"
+
+    mkdir -p \
+        "$wt_dir/orchestration/runs" \
+        "$wt_dir/orchestration/plans" \
+        "$wt_dir/orchestration/specs/archive" \
+        "$wt_dir/knowledge/patterns" \
+        "$wt_dir/knowledge/lessons" \
+        "$wt_dir/requirements" \
+        "$wt_dir/plugins" \
+        "$wt_dir/.work"
+
+    # Add wt/.work/ to .gitignore if not already present
+    local gitignore="$project_path/.gitignore"
+    if [[ -f "$gitignore" ]]; then
+        if ! grep -qx 'wt/.work/' "$gitignore" 2>/dev/null; then
+            echo 'wt/.work/' >> "$gitignore"
+        fi
+    else
+        echo 'wt/.work/' > "$gitignore"
     fi
 
-    # Delete .claude/hot-topics.json if it exists
-    if [[ -f "$project_path/.claude/hot-topics.json" ]]; then
-        rm -f "$project_path/.claude/hot-topics.json"
+    # Create .env.example with Resend email config template (if not exists)
+    local env_example="$project_path/.env.example"
+    if [[ ! -f "$env_example" ]]; then
+        cat > "$env_example" <<'ENVEOF'
+# wt-tools email notifications (optional)
+# Set notification: email or notification: desktop+email in orchestration config to enable.
+# Then fill in the values below and copy this file to .env
+# RESEND_API_KEY=re_xxxx
+# RESEND_FROM=noreply@yourdomain.com
+# RESEND_TO=you@yourdomain.com
+ENVEOF
+    fi
+
+    # Ensure .env is in .gitignore (credentials must not be committed)
+    if [[ -f "$gitignore" ]]; then
+        if ! grep -qx '.env' "$gitignore" 2>/dev/null; then
+            echo '.env' >> "$gitignore"
+        fi
+    fi
+
+    success "  Scaffolded wt/ directory structure"
+
+    # Detect legacy files and print migration suggestions
+    local found_legacy=false
+    local legacy_msgs=()
+    if [[ -f "$project_path/.claude/orchestration.yaml" ]]; then
+        legacy_msgs+=("    .claude/orchestration.yaml → wt/orchestration/config.yaml")
+        found_legacy=true
+    fi
+    if [[ -f "$project_path/project-knowledge.yaml" ]]; then
+        legacy_msgs+=("    project-knowledge.yaml → wt/knowledge/project-knowledge.yaml")
+        found_legacy=true
+    fi
+    if [[ -d "$project_path/docs/orchestration-runs" ]]; then
+        legacy_msgs+=("    docs/orchestration-runs/ → wt/orchestration/runs/")
+        found_legacy=true
+    fi
+    # Check for legacy spec files (docs/v1.md, docs/v2.md, etc.)
+    # Only flag short names like v1.md, v2_something.md — skip descriptive names like v1-minishop.md
+    local has_legacy_specs=false
+    for f in "$project_path"/docs/v[0-9]*.md; do
+        [[ -f "$f" ]] || continue
+        local fname
+        fname=$(basename "$f")
+        # Skip files with descriptive names (contain hyphen after version prefix)
+        [[ "$fname" =~ ^v[0-9]+-[a-z] ]] && continue
+        has_legacy_specs=true && break
+    done
+    if $has_legacy_specs; then
+        legacy_msgs+=("    docs/v*.md → wt/orchestration/specs/archive/")
+        found_legacy=true
+    fi
+
+    if $found_legacy; then
+        echo ""
+        info "  Found legacy files that can be migrated:"
+        for msg in "${legacy_msgs[@]}"; do
+            echo "$msg"
+        done
+        echo ""
+        info "  Run 'wt-project migrate' to move them."
     fi
 }
 
@@ -348,31 +441,190 @@ Usage: wt-project <command> [options]
 
 Commands:
   init [--name <name>]    Register current git repo as a project
+  init-knowledge          Scaffold project-knowledge.yaml from project scan
+  migrate                 Migrate legacy files to wt/ directory structure
   list                    List all registered projects
+  list-types              List available project types
   remove <name>           Remove a project from registry
   default <name>          Set default project
 
 Options:
   --name <name>           Custom project name (default: directory name)
+  --project-type <type>   Set project type (e.g., base, web)
+  --template <name>       Template variant to deploy (e.g., nextjs, spa)
+  --modules <list>        Comma-separated optional modules (e.g., gdpr,integrations)
+  --dry-run               Show what would change without modifying files
   -h, --help              Show this help
 
 Examples:
   cd /path/to/myproject && wt-project init
-  wt-project init --name myproj
+  wt-project init --name myproj --project-type web --template nextjs --modules integrations
+  wt-project init --dry-run
+  wt-project init-knowledge
+  wt-project list-types
   wt-project list
   wt-project default myproj
   wt-project remove myproj
 EOF
 }
 
+DRY_RUN=false
+
+# Deploy template files from a project type into the target project.
+# Usage: _deploy_project_templates <project-path> <type-name> [template-name] [modules]
+_deploy_project_templates() {
+    local project_path="$1"
+    local type_name="$2"
+    local template_name="${3:-}"
+    local modules="${4:-}"
+    local py
+    py=$(_wt_python)
+
+    local cmd=("$py" -m wt_project_base.cli deploy-templates --project-dir "$project_path" --type "$type_name")
+    if [[ -n "$template_name" ]]; then
+        cmd+=(--template "$template_name")
+    fi
+    if [[ -n "$modules" ]]; then
+        cmd+=(--modules "$modules")
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        cmd+=(--dry-run)
+    fi
+
+    echo ""
+    info "Deploying project templates..."
+    "${cmd[@]}" 2>&1
+    return $?
+}
+
+# Read tracked modules from project-type.yaml
+# Usage: _read_tracked_modules <project-path>
+# Prints comma-separated module list or empty string
+_read_tracked_modules() {
+    local project_path="$1"
+    local pt_file="$project_path/wt/plugins/project-type.yaml"
+    [[ -f "$pt_file" ]] || return 0
+    grep '^modules:' "$pt_file" &>/dev/null || return 0
+    # Extract module list (YAML array to comma-separated; handles "- x" or "  - x")
+    awk '/^modules:/{found=1; next} found && /^ *- /{gsub(/^ *- /,""); printf sep $0; sep=","} found && !/^ *- / && !/^$/{exit}' "$pt_file"
+}
+
+# Save template and modules to project-type.yaml (update in-place)
+# Usage: _save_template_modules <project-path> <template-name> <modules-csv>
+_save_template_modules() {
+    local project_path="$1"
+    local template_name="$2"
+    local modules_csv="$3"
+    local pt_file="$project_path/wt/plugins/project-type.yaml"
+    [[ -f "$pt_file" ]] || return 0
+
+    # Use Python for safe YAML update (avoids grep -v destroying other arrays)
+    local py
+    py=$(_wt_python)
+    "$py" -c "
+import yaml, sys
+with open('$pt_file') as f:
+    data = yaml.safe_load(f) or {}
+if '$template_name':
+    data['template'] = '$template_name'
+mods = '$modules_csv'
+if mods:
+    data['modules'] = [m.strip() for m in mods.split(',') if m.strip()]
+elif 'modules' in data:
+    del data['modules']
+with open('$pt_file', 'w') as f:
+    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+" 2>/dev/null
+}
+
+# List available optional modules for a project type template.
+# Usage: _list_available_modules <type-name> [template-name]
+# Prints module lines: "  module-id — description"
+_list_available_modules() {
+    local type_name="$1"
+    local template_name="${2:-}"
+    local py
+    py=$(_wt_python)
+    "$py" -c "
+import sys
+try:
+    from importlib.metadata import entry_points
+except ImportError:
+    from importlib_metadata import entry_points
+try:
+    eps = entry_points(group='wt_tools.project_types')
+except TypeError:
+    eps = entry_points().get('wt_tools.project_types', [])
+for ep in eps:
+    if ep.name == '$type_name':
+        cls = ep.load()
+        pt = cls()
+        from wt_project_base.deploy import resolve_template, get_available_modules
+        try:
+            tname = '${template_name}' if '${template_name}' else None
+            tid, tdir = resolve_template(pt, tname)
+        except ValueError:
+            sys.exit(1)
+        mods = get_available_modules(tdir)
+        for mid, desc in mods.items():
+            print(f'  {mid} — {desc}')
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
+# Prompt user to select optional modules interactively.
+# Usage: _prompt_modules <type-name> [template-name]
+# Sets SELECTED_MODULES variable (comma-separated) or empty.
+_prompt_modules() {
+    local type_name="$1"
+    local template_name="${2:-}"
+    SELECTED_MODULES=""
+
+    local available
+    available=$(_list_available_modules "$type_name" "$template_name")
+    [[ -z "$available" ]] && return 0
+
+    echo ""
+    info "Optional modules available:"
+    echo "$available"
+
+    # Skip interactive prompt if not a TTY (e.g., called from run.sh)
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+
+    echo ""
+    read -rp "  Select modules (comma-separated, or enter to skip): " SELECTED_MODULES
+}
+
 cmd_init() {
     local name=""
+    local project_type=""
+    local template=""
+    local modules=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)
                 name="$2"
                 shift 2
+                ;;
+            --project-type)
+                project_type="$2"
+                shift 2
+                ;;
+            --template)
+                template="$2"
+                shift 2
+                ;;
+            --modules)
+                modules="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
                 ;;
             *)
                 error "Unknown option: $1"
@@ -450,6 +702,35 @@ cmd_init() {
     echo ""
     info "Deploying wt-tools to $git_root..."
     deploy_wt_tools "$git_root" || ((_deploy_warnings++))
+
+    # Save project type if specified
+    if [[ -n "$project_type" ]]; then
+        # Resolve modules: CLI flag > tracked (before overwrite) > interactive prompt
+        local deploy_modules="$modules"
+        if [[ -z "$deploy_modules" ]]; then
+            deploy_modules=$(_read_tracked_modules "$git_root")
+        fi
+        # Read tracked template too, for re-init without --template
+        local deploy_template="$template"
+        if [[ -z "$deploy_template" ]]; then
+            local pt_file="$git_root/wt/plugins/project-type.yaml"
+            if [[ -f "$pt_file" ]]; then
+                deploy_template=$(grep '^template:' "$pt_file" 2>/dev/null | sed 's/^template: *//' || true)
+            fi
+        fi
+        _save_project_type "$git_root" "$project_type" "$deploy_template" "$deploy_modules"
+        # If still no modules, prompt interactively
+        if [[ -z "$deploy_modules" ]]; then
+            _prompt_modules "$project_type" "$deploy_template"
+            deploy_modules="$SELECTED_MODULES"
+        fi
+        # Deploy templates from the project type
+        _deploy_project_templates "$git_root" "$project_type" "$deploy_template" "$deploy_modules" || true
+        # Save template and module selection for re-init
+        if [[ -n "$deploy_template" || -n "$deploy_modules" ]]; then
+            _save_template_modules "$git_root" "$deploy_template" "$deploy_modules"
+        fi
+    fi
 
     # If called from a worktree, also deploy to the worktree's own .claude/ dir
     # and register MCP for the worktree path scope
@@ -607,6 +888,229 @@ cmd_default() {
     success "Default project set to '$name'"
 }
 
+# Migrate legacy files to wt/ directory structure.
+# Uses git mv when in a git repo, plain mv otherwise.
+cmd_migrate() {
+    if ! is_git_repo; then
+        error "Current directory is not a git repository"
+        exit 1
+    fi
+
+    local git_root
+    git_root=$(get_git_root)
+    local use_git=true
+    local migrated=0
+
+    # Helper: move file/dir with git mv or plain mv
+    _migrate_move() {
+        local src="$1"
+        local dst="$2"
+        mkdir -p "$(dirname "$dst")"
+        if $use_git; then
+            git -C "$git_root" mv "$src" "$dst" 2>/dev/null || mv "$src" "$dst"
+        else
+            mv "$src" "$dst"
+        fi
+    }
+
+    # 1. orchestration.yaml → wt/orchestration/config.yaml
+    local orch_src="$git_root/.claude/orchestration.yaml"
+    local orch_dst="$git_root/wt/orchestration/config.yaml"
+    if [[ -f "$orch_src" && ! -f "$orch_dst" ]]; then
+        _migrate_move "$orch_src" "$orch_dst"
+        success "  Migrated .claude/orchestration.yaml → wt/orchestration/config.yaml"
+        migrated=$((migrated + 1))
+    fi
+
+    # 2. project-knowledge.yaml → wt/knowledge/project-knowledge.yaml
+    local pk_src="$git_root/project-knowledge.yaml"
+    local pk_dst="$git_root/wt/knowledge/project-knowledge.yaml"
+    if [[ -f "$pk_src" && ! -f "$pk_dst" ]]; then
+        _migrate_move "$pk_src" "$pk_dst"
+        success "  Migrated project-knowledge.yaml → wt/knowledge/project-knowledge.yaml"
+        migrated=$((migrated + 1))
+    fi
+
+    # 3. docs/orchestration-runs/* → wt/orchestration/runs/
+    local runs_src="$git_root/docs/orchestration-runs"
+    local runs_dst="$git_root/wt/orchestration/runs"
+    if [[ -d "$runs_src" ]] && ls "$runs_src"/*.md &>/dev/null; then
+        mkdir -p "$runs_dst"
+        for f in "$runs_src"/*.md; do
+            local fname
+            fname=$(basename "$f")
+            if [[ ! -f "$runs_dst/$fname" ]]; then
+                _migrate_move "$f" "$runs_dst/$fname"
+            fi
+        done
+        # Remove empty source dir
+        rmdir "$runs_src" 2>/dev/null || true
+        success "  Migrated docs/orchestration-runs/ → wt/orchestration/runs/"
+        migrated=$((migrated + 1))
+    fi
+
+    # 4. docs/v[0-9]*.md (legacy spec files) → wt/orchestration/specs/archive/
+    local specs_dst="$git_root/wt/orchestration/specs/archive"
+    local found_specs=false
+    for f in "$git_root"/docs/v[0-9]*.md; do
+        [[ -f "$f" ]] || continue
+        found_specs=true
+        local fname
+        fname=$(basename "$f")
+        if [[ ! -f "$specs_dst/$fname" ]]; then
+            _migrate_move "$f" "$specs_dst/$fname"
+        fi
+    done
+    if $found_specs; then
+        success "  Migrated docs/v*.md spec files → wt/orchestration/specs/archive/"
+        migrated=$((migrated + 1))
+    fi
+
+    if [[ $migrated -eq 0 ]]; then
+        info "No legacy files found to migrate."
+    else
+        success "Migrated $migrated item(s). Review with 'git status' and commit."
+    fi
+}
+
+cmd_init_knowledge() {
+    if ! is_git_repo; then
+        error "Current directory is not a git repository"
+        exit 1
+    fi
+
+    local git_root
+    git_root=$(get_git_root)
+    # Prefer wt/knowledge/ when wt/ exists, fallback to project root
+    local pk_file="$git_root/project-knowledge.yaml"
+    if [[ -d "$git_root/wt/knowledge" ]]; then
+        pk_file="$git_root/wt/knowledge/project-knowledge.yaml"
+    fi
+    local template="$WT_TOOLS_ROOT/templates/project-knowledge.yaml"
+
+    if [[ -f "$pk_file" ]]; then
+        info "project-knowledge.yaml already exists at $pk_file"
+        echo "Edit it manually to add cross-cutting files and features."
+        return 0
+    fi
+    # Also check legacy location if targeting wt/
+    if [[ "$pk_file" == *"/wt/knowledge/"* && -f "$git_root/project-knowledge.yaml" ]]; then
+        info "project-knowledge.yaml exists at project root. Run 'wt-project migrate' to move it."
+        return 0
+    fi
+
+    # Check if a project type is configured — use its templates instead of generic
+    local pt_yaml="$git_root/wt/plugins/project-type.yaml"
+    if [[ -f "$pt_yaml" ]]; then
+        local pt_name
+        pt_name=$(grep '^type:' "$pt_yaml" 2>/dev/null | awk '{print $2}' || true)
+        if [[ -n "$pt_name" && "$pt_name" != "base" ]]; then
+            info "Project type '$pt_name' configured — deploying type-specific templates"
+            _deploy_project_templates "$git_root" "$pt_name" "" || true
+            # Deploy cross-cutting checklist if not exists
+            local checklist_src="$WT_TOOLS_ROOT/templates/cross-cutting-checklist.md"
+            local checklist_dst="$git_root/.claude/rules/cross-cutting-checklist.md"
+            if [[ -f "$checklist_src" && ! -f "$checklist_dst" ]]; then
+                mkdir -p "$(dirname "$checklist_dst")"
+                cp "$checklist_src" "$checklist_dst"
+                success "Deployed cross-cutting-checklist.md to .claude/rules/"
+            fi
+            return 0
+        fi
+    fi
+
+    # Fallback to generic template
+    if [[ ! -f "$template" ]]; then
+        error "Template not found: $template"
+        exit 1
+    fi
+
+    # Scan project for common cross-cutting patterns
+    local cross_cutting_entries=""
+    local found=0
+
+    # i18n / translation files
+    local i18n_files
+    i18n_files=$(find "$git_root" -maxdepth 5 \( -path "*/i18n/*.json" -o -path "*/locales/*.json" -o -path "*/lang/*.json" \) -not -path "*/node_modules/*" 2>/dev/null | head -5 || true)
+    if [[ -n "$i18n_files" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local rel="${f#$git_root/}"
+            cross_cutting_entries+="  - path: $rel"$'\n'"    description: Translation file"$'\n'
+            found=$((found + 1))
+        done <<< "$i18n_files"
+    fi
+
+    # Sidebar / navigation components
+    local sidebar
+    sidebar=$(find "$git_root" -maxdepth 5 \( -iname "*sidebar*" -o -iname "*navigation*" -o -iname "*nav-menu*" \) -not -path "*/node_modules/*" 2>/dev/null | grep -E '\.(tsx?|jsx?|vue|svelte)$' || true)
+    if [[ -n "$sidebar" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local rel="${f#$git_root/}"
+            cross_cutting_entries+="  - path: $rel"$'\n'"    description: Navigation component"$'\n'
+            found=$((found + 1))
+        done <<< "$sidebar"
+    fi
+
+    # Route definitions
+    local routes
+    routes=$(find "$git_root" -maxdepth 5 \( -iname "routes.*" -o -iname "router.*" \) -not -path "*/node_modules/*" 2>/dev/null | grep -E '\.(tsx?|jsx?|py|rb)$' || true)
+    if [[ -n "$routes" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local rel="${f#$git_root/}"
+            cross_cutting_entries+="  - path: $rel"$'\n'"    description: Route definitions"$'\n'
+            found=$((found + 1))
+        done <<< "$routes"
+    fi
+
+    # Database schema files
+    local schemas
+    schemas=$(find "$git_root" -maxdepth 4 \( -iname "schema.prisma" -o -iname "schema.rb" \) -not -path "*/node_modules/*" 2>/dev/null | head -3 || true)
+    if [[ -n "$schemas" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local rel="${f#$git_root/}"
+            cross_cutting_entries+="  - path: $rel"$'\n'"    description: Database schema"$'\n'
+            found=$((found + 1))
+        done <<< "$schemas"
+    fi
+
+    # Copy template
+    cp "$template" "$pk_file"
+
+    # If we found cross-cutting files, inject them
+    if [[ -n "$cross_cutting_entries" && "$found" -gt 0 ]]; then
+        # Replace the commented examples under cross_cutting_files with actual entries
+        local tmp
+        tmp=$(mktemp)
+        awk -v entries="$cross_cutting_entries" '
+            /^cross_cutting_files:/ { print; found=1; next }
+            found && /^[^ #]/ { printf "%s", entries; found=0 }
+            found && /^  #/ { next }
+            { print }
+            END { if (found) printf "%s", entries }
+        ' "$pk_file" > "$tmp" && mv "$tmp" "$pk_file"
+    fi
+
+    success "Created $pk_file"
+    if [[ "$found" -gt 0 ]]; then
+        info "Auto-detected $found cross-cutting file(s) — review and edit the file"
+    else
+        info "No cross-cutting files auto-detected — edit manually to add entries"
+    fi
+
+    # Deploy cross-cutting checklist if not exists
+    local checklist_src="$WT_TOOLS_ROOT/templates/cross-cutting-checklist.md"
+    local checklist_dst="$git_root/.claude/rules/cross-cutting-checklist.md"
+    if [[ -f "$checklist_src" && ! -f "$checklist_dst" ]]; then
+        mkdir -p "$(dirname "$checklist_dst")"
+        cp "$checklist_src" "$checklist_dst"
+        success "Deployed cross-cutting-checklist.md to .claude/rules/"
+    fi
+}
+
 # Main
 if [[ $# -eq 0 ]]; then
     usage
@@ -618,8 +1122,20 @@ case "$1" in
         shift
         cmd_init "$@"
         ;;
+    init-knowledge)
+        shift
+        cmd_init_knowledge "$@"
+        ;;
+    migrate)
+        shift
+        cmd_migrate "$@"
+        ;;
     list|ls)
         cmd_list
+        ;;
+    list-types)
+        echo "Available project types:"
+        _list_project_types
         ;;
     remove|rm)
         shift

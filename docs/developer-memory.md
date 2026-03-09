@@ -1,3 +1,5 @@
+[< Back to README](../README.md)
+
 # Developer Memory
 
 Per-project cognitive memory for AI agents. Agents save decisions, learnings, and context as they work — future agents in different sessions recall relevant past experience before starting. Built on [shodh-memory](https://github.com/varun29ankuS/shodh-memory), integrated across CLI, GUI, and OpenSpec workflows.
@@ -149,6 +151,25 @@ wt-memory recall "project structure"
 | **Context** | Background info that provides orientation | "This repo deploys to AWS Lambda via CDK, pipeline in infra/ directory" |
 
 **Legacy aliases:** `Observation` maps to `Learning`, `Event` maps to `Context`. These still work but print a deprecation warning.
+
+### Phase Tags (Orchestration)
+
+When memories are created during orchestration, they are tagged with a phase to enable filtered recall:
+
+| Tag | Source | Recalled during |
+|-----|--------|-----------------|
+| `phase:planning` | Decomposition learnings | Planning/decomposition |
+| `phase:execution` | Worker agent learnings | Change dispatch |
+| `phase:verification` | Test/review/smoke results | Verification retries |
+| `phase:orchestration` | Operational decisions (replan, merge) | Iteration replans |
+| `phase:merge` | Merge outcomes | Merge conflict resolution |
+| `phase:test` | Test pass/fail results | Test retries |
+| `phase:review` | Code review results | Review retries |
+| `phase:post-merge` | Post-merge pipeline results | Post-merge fixes |
+
+The `orch_recall` function filters by phase tag, so planning memories don't leak into execution and vice versa.
+
+Memories tagged `stale:true` are excluded from all orchestrator recall.
 
 ---
 
@@ -711,72 +732,11 @@ Generates an interactive HTML dashboard with charts (token burn per day, relevan
 
 ---
 
-## Benchmark — MemoryProbe
+## Benchmarks
 
-The `benchmark/synthetic/` directory contains **MemoryProbe**, a synthetic benchmark that measures how well the memory system helps agents apply project conventions across fresh sessions.
+**Synthetic (MemoryProbe):** +34% weighted convention compliance when knowledge only exists in memory. **Real-world (CraftBazaar v6):** no measurable delta yet — test infrastructure gaps mask potential benefits.
 
-### What it measures
-
-5 sequential changes (C01-C05) implement a LogBook REST API. Each session starts with a fresh Claude context — memory is the only bridge between sessions. C01-C02 establish and correct 10 non-standard conventions. C03-C05 probe whether the agent recalls them.
-
-**10 convention traps (T1-T10)** across 3 weighted categories:
-
-| Category | Weight | Examples |
-|----------|--------|---------|
-| A: Code-readable | x1 | Pagination format, soft-delete column, ID prefixes |
-| B: Human override | x2 | Error code notation (dot vs SCREAMING_SNAKE), response nesting |
-| C: Forward-looking | x3 | Batch IDs in POST body — no code to read |
-
-### Modes
-
-| Mode | Description | Starts at | Port |
-|------|-------------|-----------|------|
-| A | Baseline — no memory | C01 | 4000 |
-| B | Full memory (save + recall) | C01 | 4001 |
-| C | Pre-seeded memories — recall only | C03 | 4001 |
-| D | Rules layer — `.claude/rules.yaml` preset | C03 | 4002 |
-
-Mode D tests the hypothesis: **deterministic rules ≥ probabilistic memory recall** for hard constraints (Category B).
-
-### Quick run
-
-```bash
-cd benchmark/synthetic
-
-# Bootstrap
-./scripts/init.sh --mode a --target ~/bench/probe-a
-./scripts/init.sh --mode d --target ~/bench/probe-d
-
-# Run Mode A (all changes), Mode D (C03-C05 only)
-./scripts/run.sh ~/bench/probe-a &
-./scripts/run.sh ~/bench/probe-d --start 3 --end 5 &
-wait
-
-# Score and compare
-./scripts/score.sh --compare ~/bench/probe-a ~/bench/probe-d
-```
-
-See `benchmark/synthetic/run-guide.md` for full protocol, n=3 methodology, and expected scores.
-
-### Current results
-
-**Synthetic benchmark (MemoryProbe)** — consistent +34% weighted improvement:
-
-| Run | Mode A (baseline) | Mode B (memory) | Delta |
-|-----|-------------------|-----------------|-------|
-| SYN-05 | 45% | 79% | **+34%** |
-| SYN-06 (hook-driven) | 45% | 79% | **+34%** |
-
-SYN-06 also showed 20% fewer tokens and 17% fewer turns with memory enabled. The biggest saving was session S03: 72 → 34 turns, 2.67M → 1.02M tokens (-62%). Category C traps (human-override conventions invisible in code) drive the delta — memory is the only way to recall them across sessions.
-
-**Real-world benchmark (CraftBazaar v6)** — no measurable delta yet:
-
-| Metric | Run A (baseline) | Run B (memory) |
-|--------|-----------------|----------------|
-| Trap score | 11.5/13 | 11/13 |
-| C12 bugs fixed | 11/12 | 9/12 |
-
-The real-world benchmark does not yet show a memory advantage. Root cause: the test infrastructure is too weak to detect the difference — 71% of test-12 checks pass without a running server, pagination checks match `import` statements instead of rendered components, and toast checks don't verify global mounting. These infrastructure gaps mask potential memory benefits. The v7 benchmark will address this with stronger behavioral tests (P0: render checks instead of import checks, payout algorithm verification, global mount validation).
+See [Research: Benchmark Results](research/benchmark-results.md) for full methodology, per-trap analysis, and evolution across 10 runs.
 
 ---
 
@@ -834,3 +794,7 @@ The real-world benchmark does not yet show a memory advantage. Root cause: the t
 - **No hard dependency**: Everything degrades gracefully. Memory is an enhancement, not a requirement.
 
 </details>
+
+---
+
+*See also: [Getting Started](getting-started.md) · [Configuration](configuration.md) · [MCP Server](mcp-server.md) · [CLI Reference](cli-reference.md)*
