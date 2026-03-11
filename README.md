@@ -127,6 +127,45 @@ See [Getting Started](docs/getting-started.md) for the full guide.
 
 ![Orchestrator workspace — TUI, memory dashboard, agent terminal](docs/images/orchestrator-workspace.png)
 
+## Benchmark: What does autonomous orchestration look like?
+
+We run a repeatable benchmark: build a **Next.js webshop from a single spec file** — products, cart, checkout, admin auth, admin CRUD — with zero human intervention.
+
+**Run #4 results** (the latest):
+
+```
+Spec ──► 6 changes planned ──► parallel agents ──► all 6 merged ──► done
+
+Wall clock:        1h 45m
+Human interventions: 0
+Merge conflicts:     0
+Jest unit tests:    38 (6 suites)
+Playwright E2E:     32 (6 spec files)
+Source files:       47 TypeScript/TSX
+Verify retries:     5 (all self-healed)
+```
+
+```
+22:06          22:30     22:46          23:04    23:13              23:51
+  │              │         │              │        │                  │
+  ├─ Plan (3m)   │         │              │        │                  │
+  ├─ Infra ──────┤ 19m     │              │        │                  │
+  │              ├─ Prods ─┤ 12m          │        │                  │
+  │              │         ├─ Cart ───────┤ 16m    │                  │
+  │              │         ├─ Auth ───────┼────────┤ 26m              │
+  │              │         │              ├─ Orders┤ 18m              │
+  │              │         │              │        ├─ Admin Products ─┤ 36m
+  │              │         │              │        │                  │
+  done           done      │         2 parallel    │            2 parallel
+                           │              │        │                  │
+```
+
+Every change passes: **Jest → Build → Playwright E2E → OpenSpec verify → Merge → Post-merge smoke.**
+
+Full details with quality gate breakdown, retry analysis, and run-over-run comparison: **[Benchmark Report](docs/benchmark-minishop-run4.md)**
+
+---
+
 ## Fork & Adapt
 
 Our primary focus is web development — that's where we push hardest. But wt-tools is project-agnostic by design. The base tooling (worktrees, memory, orchestration) works on any codebase: APIs, mobile apps, data pipelines, research projects. Built from months of production work across web apps, sensor systems, education platforms, and more.
@@ -161,13 +200,39 @@ The installer handles everything: CLI symlinks, shell completions, MCP server co
 
 | Platform / Tool | Status |
 |---|---|
-| **Linux** | Primary — tested on Ubuntu 22.04+ |
-| **macOS** | Supported |
+| **Linux** | Primary development platform — tested on Ubuntu 22.04+ |
+| **macOS** | Partial — core functionality works, contributors are actively improving macOS parity |
 | **Zed** | Primary editor, best tested |
 | **VS Code / Cursor / Windsurf** | Supported via `wt-config editor set` |
 | **Claude Code** | Integrated — auto-launch, MCP, skill hooks |
 
+> **Note:** Feature development is Linux-first. macOS is supported and used in production, but some platform-specific behavior (e.g. window management, process signals) may differ. We welcome macOS-focused contributions.
+
 ---
+
+## Project Types & Convention Plugins
+
+When multiple agents work on a codebase, they need shared conventions — not copied into CLAUDE.md (which wastes context every turn), but loaded on demand when relevant files are touched.
+
+**Project type plugins** solve this:
+
+```
+wt-project-base          Universal rules (file size, secrets, TODOs)
+  └── wt-project-web      Web domain rules (SEO, a11y, security, i18n, ...)
+        └── your-org-web   Organization-specific rules
+```
+
+```bash
+wt-project init --project-type web --template nextjs
+```
+
+This deploys path-scoped convention files, verification rules, and orchestration directives into the project. Agents only see the rules relevant to the files they're editing — an agent working on `prisma/schema.prisma` gets data-model conventions, not UI rules.
+
+Available project types:
+- **[wt-project-base](https://github.com/tatargabor/wt-project-base)** — universal rules for any codebase
+- **[wt-project-web](https://github.com/tatargabor/wt-project-web)** — 12 convention areas, 11 verification rules, 7 orchestration directives for modern web apps
+
+See [Plugin Architecture](https://github.com/tatargabor/wt-project-web/blob/master/docs/plugin-architecture.md) for customization and layering.
 
 ## Plugins
 
@@ -230,7 +295,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull request gu
 
 ## Acknowledgements
 
-Built and used in production by [ITLine Kft.](https://itline.hu) and [Zengo Kft.](https://zengo.eu). Collaboration partners: [BlackBelt](https://blackbelt.hu) · [AIOrigo](https://aiorigo.com) · [MKIK](https://mkik.hu).
+Built by [Gabor Tatar](https://itline.hu) (ITLine Kft.) and used across production projects.
+
+Partners: [Zengo Kft.](https://zengo.eu)
+
+Special thanks: [BlackBelt](https://blackbelt.hu) · [AIOrigo](https://aiorigo.com) · [MKIK](https://mkik.hu)
 
 ## License
 

@@ -44,11 +44,16 @@ init_state() {
         cache_read_tokens_prev: 0,
         cache_create_tokens_prev: 0,
         test_result: null,
+        test_stats: null,
         smoke_result: null,
+        smoke_stats: null,
 
-
-        verify_retry_count: 0
-    }]' "$plan_file")
+        verify_retry_count: 0,
+        redispatch_count: 0
+    }
+    + (if .requirements then {requirements: .requirements} else {} end)
+    + (if .also_affects_reqs then {also_affects_reqs: .also_affects_reqs} else {} end)
+    ]' "$plan_file")
 
     jq -n \
         --argjson plan_version "$plan_version" \
@@ -163,11 +168,61 @@ deps_satisfied() {
     while IFS= read -r dep; do
         local dep_status
         dep_status=$(get_change_status "$dep")
-        if [[ "$dep_status" != "merged" ]]; then
+        if [[ "$dep_status" != "merged" && "$dep_status" != "skipped" ]]; then
             return 1
         fi
     done <<< "$deps"
 
+    return 0
+}
+
+# Check if any depends_on for a change has failed (terminal state)
+# Returns 0 if a dependency is failed/merge-blocked, 1 otherwise
+deps_failed() {
+    local change_name="$1"
+    local deps
+    deps=$(jq -r --arg name "$change_name" \
+        '.changes[] | select(.name == $name) | .depends_on[]?' "$STATE_FILENAME" 2>/dev/null)
+
+    [[ -z "$deps" ]] && return 1  # no dependencies → not failed
+
+    while IFS= read -r dep; do
+        local dep_status
+        dep_status=$(get_change_status "$dep")
+        if [[ "$dep_status" == "failed" || "$dep_status" == "merge-blocked" ]]; then
+            return 0
+        fi
+    done <<< "$deps"
+
+    return 1
+}
+
+# Cascade failure: mark pending changes as failed if their dependencies have failed.
+# Prevents deadlock where failed deps leave children stuck in pending forever.
+cascade_failed_deps() {
+    local cascaded=0
+    local pending_changes
+    pending_changes=$(jq -r '.changes[] | select(.status == "pending") | .name' "$STATE_FILENAME" 2>/dev/null)
+
+    [[ -z "$pending_changes" ]] && return 0
+
+    while IFS= read -r change_name; do
+        if deps_failed "$change_name"; then
+            local failed_dep
+            failed_dep=$(jq -r --arg name "$change_name" \
+                '.changes[] | select(.name == $name) | .depends_on[]?' "$STATE_FILENAME" 2>/dev/null | while read d; do
+                    local s; s=$(get_change_status "$d")
+                    [[ "$s" == "failed" || "$s" == "merge-blocked" ]] && echo "$d" && break
+                done)
+            log_warn "Cascade: $change_name failed — dependency '$failed_dep' is terminal"
+            emit_event "CASCADE_FAILED" "$change_name" "{\"reason\":\"dependency_failed\",\"failed_dep\":\"$failed_dep\"}"
+            update_change_field "$change_name" "status" '"failed"'
+            update_change_field "$change_name" "failure_reason" "\"dependency $failed_dep failed\""
+            cascaded=$((cascaded + 1))
+        fi
+    done <<< "$pending_changes"
+
+    [[ "$cascaded" -gt 0 ]] && log_info "Cascade: $cascaded changes marked failed due to dependency failures"
     return 0
 }
 
@@ -351,7 +406,11 @@ cmd_status() {
     local verify_failed
     verify_failed=$(count_changes_by_status "verify-failed")
 
+    local skipped
+    skipped=$(count_changes_by_status "skipped")
+
     echo "  Progress: $merged merged, $done_count done, $running running, $pending pending"
+    [[ "$skipped" -gt 0 ]] && echo "  Skipped:  $skipped"
     [[ "$verifying" -gt 0 ]] && echo "  Verifying: $verifying"
     [[ "$verify_failed" -gt 0 ]] && echo "  Verify-failed: $verify_failed"
     [[ "$failed" -gt 0 ]] && echo "  Failed:   $failed"
@@ -427,8 +486,13 @@ cmd_status() {
     printf "  %-25s %-14s %-15s %-8s %-8s %-10s %-14s\n" "Change" "Status" "Progress" "Tests" "Review" "Tokens" "Gate Cost"
     printf "  %-25s %-14s %-15s %-8s %-8s %-10s %-14s\n" "─────────────────────────" "──────────────" "───────────────" "────────" "────────" "──────────" "──────────────"
 
-    jq -r '.changes[] | "\(.name)\t\(.status)\t\(.tokens_used)\t\(.test_result // "-")\t\(.review_result // "-")\t\(.gate_total_ms // 0)\t\(.gate_retry_tokens // 0)\t\(.gate_retry_count // 0)"' "$STATE_FILENAME" | \
-    while IFS=$'\t' read -r name change_status tokens test_res review_res g_ms g_rtok g_rcnt; do
+    jq -r '.changes[] | "\(.name)\t\(.status)\t\(.tokens_used)\t\(.test_result // "-")\t\(.review_result // "-")\t\(.gate_total_ms // 0)\t\(.gate_retry_tokens // 0)\t\(.gate_retry_count // 0)\t\(.redispatch_count // 0)"' "$STATE_FILENAME" | \
+    while IFS=$'\t' read -r name change_status tokens test_res review_res g_ms g_rtok g_rcnt redisp_cnt; do
+        # Append redispatch indicator to status
+        local display_status="$change_status"
+        if [[ "${redisp_cnt:-0}" -gt 0 ]]; then
+            display_status="${change_status} (R${redisp_cnt}/${MAX_REDISPATCH:-2})"
+        fi
         local progress="-"
         # Try to read iteration progress from worktree
         local wt_path
@@ -450,7 +514,7 @@ cmd_status() {
                 gate_col="${gate_col} +${rtok_k}k"
             fi
         fi
-        printf "  %-25s %-14s %-15s %-8s %-8s %-10s %-14s\n" "$name" "$change_status" "$progress" "$test_res" "$review_res" "$tokens" "$gate_col"
+        printf "  %-25s %-14s %-15s %-8s %-8s %-10s %-14s\n" "$name" "$display_status" "$progress" "$test_res" "$review_res" "$tokens" "$gate_col"
     done
 
     # Manual task hints for waiting:human changes
@@ -529,9 +593,11 @@ cmd_approve() {
         local cs
         cs=$(get_change_status "$change_name" 2>/dev/null || true)
         if [[ "$cs" == "merge-blocked" ]]; then
-            update_change_field "$change_name" "status" '"done"'
-            log_info "Change $change_name unblocked — ready for merge retry"
-            success "Change '$change_name' unblocked"
+            update_change_field "$change_name" "status" '"merge-blocked"'
+            update_change_field "$change_name" "merge_retry_count" "0"
+            update_change_field "$change_name" "last_conflict_fingerprint" '""'
+            log_info "Change $change_name unblocked — merge retry count reset"
+            success "Change '$change_name' unblocked — will retry merge on next poll cycle"
             return 0
         elif [[ -z "$cs" ]]; then
             error "Change '$change_name' not found"
@@ -578,8 +644,8 @@ trigger_checkpoint() {
     log_info "Checkpoint triggered: $reason"
     emit_event "CHECKPOINT" "" "{\"reason\":\"$reason\"}"
 
-    # Generate summary
-    generate_summary "$reason"
+    # Generate summary (non-fatal — don't let summary crash kill the orchestrator)
+    generate_summary "$reason" || log_warn "Summary generation failed (non-fatal)"
 
     # Add checkpoint to state
     local tmp

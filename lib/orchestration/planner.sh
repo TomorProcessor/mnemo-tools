@@ -210,6 +210,39 @@ validate_plan() {
         errors=$((errors + 1))
     fi
 
+    # Digest-mode validation: check spec_files, requirements, also_affects_reqs
+    if [[ "${INPUT_MODE:-}" == "digest" && -f "$DIGEST_DIR/requirements.json" ]]; then
+        local all_req_ids
+        all_req_ids=$(jq -r '[.requirements[]? | select(.status != "removed") | .id] | .[]' "$DIGEST_DIR/requirements.json" 2>/dev/null || true)
+
+        # Check requirements reference valid IDs
+        local plan_req_ids
+        plan_req_ids=$(jq -r '.changes[]? | (.requirements[]?, .also_affects_reqs[]?)' "$plan_file" 2>/dev/null || true)
+        if [[ -n "$plan_req_ids" ]]; then
+            while IFS= read -r rid; do
+                [[ -z "$rid" ]] && continue
+                if ! echo "$all_req_ids" | grep -qxF "$rid"; then
+                    warn "Plan references non-existent requirement: $rid"
+                    # Non-fatal warning, don't increment errors
+                fi
+            done <<< "$plan_req_ids"
+        fi
+
+        # Check also_affects_reqs have a primary owner
+        local also_affects_ids
+        also_affects_ids=$(jq -r '.changes[]? | .also_affects_reqs[]?' "$plan_file" 2>/dev/null | sort -u || true)
+        if [[ -n "$also_affects_ids" ]]; then
+            local primary_owned_ids
+            primary_owned_ids=$(jq -r '.changes[]? | .requirements[]?' "$plan_file" 2>/dev/null | sort -u || true)
+            while IFS= read -r aaid; do
+                [[ -z "$aaid" ]] && continue
+                if ! echo "$primary_owned_ids" | grep -qxF "$aaid"; then
+                    warn "also_affects_reqs '$aaid' has no primary owner in any change's requirements[]"
+                fi
+            done <<< "$also_affects_ids"
+        fi
+    fi
+
     # Check for scope overlap between planned changes
     check_scope_overlap "$plan_file"
 
@@ -344,6 +377,74 @@ find_project_knowledge_file() {
     wt_find_config project-knowledge
 }
 
+# ─── Triage Gate ─────────────────────────────────────────────────────
+
+# Check triage status for ambiguities. Returns one of:
+#   no_ambiguities — zero ambiguities, skip entirely
+#   needs_triage   — ambiguities exist but no triage.md
+#   has_untriaged  — triage.md exists but has blank decisions
+#   has_fixes      — all triaged but some marked "fix" (spec needs correction)
+#   passed         — all triaged, no fixes, ready to proceed
+check_triage_gate() {
+    if [[ ! -f "$DIGEST_DIR/ambiguities.json" ]]; then
+        echo "no_ambiguities"
+        return 0
+    fi
+
+    local amb_count
+    amb_count=$(jq '.ambiguities | length' "$DIGEST_DIR/ambiguities.json" 2>/dev/null || echo 0)
+    if [[ "$amb_count" -eq 0 ]]; then
+        echo "no_ambiguities"
+        return 0
+    fi
+
+    # In automated mode (orchestrator), auto-defer everything
+    if [[ "${TRIAGE_AUTO_DEFER:-false}" == "true" ]]; then
+        # Auto-defer: generate triage if missing, mark all as defer
+        if [[ ! -f "$DIGEST_DIR/triage.md" ]]; then
+            generate_triage_md "$DIGEST_DIR/ambiguities.json" "$DIGEST_DIR/triage.md"
+        fi
+        # Build auto-defer decisions for all ambiguities
+        local auto_decisions
+        auto_decisions=$(jq '[.ambiguities[].id] | map({key: ., value: {decision: "defer", note: ""}}) | from_entries' "$DIGEST_DIR/ambiguities.json")
+        merge_triage_to_ambiguities "$DIGEST_DIR/ambiguities.json" "$auto_decisions" "auto"
+        info "Auto-deferred $amb_count ambiguities (automated mode)"
+        echo "passed"
+        return 0
+    fi
+
+    if [[ ! -f "$DIGEST_DIR/triage.md" ]]; then
+        echo "needs_triage"
+        return 0
+    fi
+
+    # Parse triage decisions
+    local decisions
+    decisions=$(parse_triage_md "$DIGEST_DIR/triage.md")
+
+    # Check for untriaged items (blank decision)
+    local untriaged_count
+    untriaged_count=$(jq -r --argjson decisions "$decisions" \
+        '[.ambiguities[].id] | map(. as $id | if $decisions[$id].decision == "" or ($decisions[$id] | not) then 1 else 0 end) | add // 0' \
+        "$DIGEST_DIR/ambiguities.json")
+
+    if [[ "$untriaged_count" -gt 0 ]]; then
+        echo "has_untriaged"
+        return 0
+    fi
+
+    # Check for "fix" items
+    local fix_count
+    fix_count=$(echo "$decisions" | jq '[.[] | select(.decision == "fix")] | length')
+
+    if [[ "$fix_count" -gt 0 ]]; then
+        echo "has_fixes"
+        return 0
+    fi
+
+    echo "passed"
+}
+
 # ─── Subcommands ─────────────────────────────────────────────────────
 
 cmd_plan() {
@@ -392,10 +493,93 @@ cmd_plan() {
 
     info "Reading input ($INPUT_MODE): $INPUT_PATH"
 
+    # Auto-digest trigger: if directory input, ensure digest exists and is fresh
+    if [[ "$INPUT_MODE" == "digest" ]]; then
+        local freshness
+        freshness=$(check_digest_freshness "$INPUT_PATH")
+        case "$freshness" in
+            fresh)
+                info "Using existing digest (fresh)"
+                ;;
+            stale)
+                info "Digest is stale — auto-re-digesting..."
+                log_info "Auto-digest triggered (stale)"
+                cmd_digest --spec "$INPUT_PATH" || {
+                    error "Auto-digest failed"
+                    return 1
+                }
+                ;;
+            missing)
+                info "Auto-generating digest..."
+                log_info "Auto-digest triggered (no existing digest)"
+                cmd_digest --spec "$INPUT_PATH" || {
+                    error "Auto-digest failed"
+                    return 1
+                }
+                ;;
+        esac
+    fi
+
+    # Triage gate: check ambiguities before planning
+    if [[ "$INPUT_MODE" == "digest" ]]; then
+        local triage_result
+        triage_result=$(check_triage_gate)
+        case "$triage_result" in
+            no_ambiguities)
+                ;; # proceed
+            needs_triage)
+                # Generate triage.md and pause
+                generate_triage_md "$DIGEST_DIR/ambiguities.json" "$DIGEST_DIR/triage.md"
+                local _nt_count
+                _nt_count=$(jq '.ambiguities | length' "$DIGEST_DIR/ambiguities.json" 2>/dev/null || echo 0)
+                info "Triage required: $_nt_count ambiguities detected."
+                info "Review $DIGEST_DIR/triage.md, then re-run plan."
+                return 0
+                ;;
+            has_untriaged)
+                local _ut_count
+                _ut_count=$(parse_triage_md "$DIGEST_DIR/triage.md" | jq '[.[] | select(.decision == "")] | length')
+                info "$_ut_count untriaged ambiguities remain. Review $DIGEST_DIR/triage.md."
+                return 0
+                ;;
+            has_fixes)
+                local _fx_count
+                _fx_count=$(parse_triage_md "$DIGEST_DIR/triage.md" | jq '[.[] | select(.decision == "fix")] | length')
+                info "$_fx_count ambiguities marked 'fix' — update specs and re-run digest."
+                return 0
+                ;;
+            passed)
+                local _triage_decisions
+                _triage_decisions=$(parse_triage_md "$DIGEST_DIR/triage.md")
+                merge_triage_to_ambiguities "$DIGEST_DIR/ambiguities.json" "$_triage_decisions"
+                info "Triage complete — proceeding with planning"
+                ;;
+        esac
+    fi
+
     # Resolve directives (4-level precedence chain)
     local directives
-    directives=$(resolve_directives "$INPUT_PATH")
+    # In digest mode, resolve from index.json (no document directives)
+    if [[ "$INPUT_MODE" == "digest" ]]; then
+        directives=$(load_config_file)
+        # Apply defaults for missing keys
+        directives=$(echo '{}' | jq --argjson cfg "$directives" \
+            --argjson mp "$DEFAULT_MAX_PARALLEL" \
+            --arg mpol "$DEFAULT_MERGE_POLICY" \
+            --argjson cp "$DEFAULT_CHECKPOINT_EVERY" \
+            '{
+                max_parallel: ($cfg.max_parallel // $mp),
+                merge_policy: ($cfg.merge_policy // $mpol),
+                checkpoint_every: ($cfg.checkpoint_every // $cp)
+            } + $cfg')
+    else
+        directives=$(resolve_directives "$INPUT_PATH")
+    fi
     info "Directives: $(echo "$directives" | jq -c .)"
+
+    # Export require_full_coverage for populate_coverage() to read
+    export REQUIRE_FULL_COVERAGE
+    REQUIRE_FULL_COVERAGE=$(echo "$directives" | jq -r '.require_full_coverage // false')
 
     # Check if agent-based planning is requested
     local plan_method
@@ -506,12 +690,103 @@ ${orch_mem}"
         test_infra_context="Test Infrastructure: NONE — first change must set up test framework"
     fi
 
-    # Build decomposition prompt (dual-mode: brief vs spec)
+    # Build decomposition prompt (tri-mode: digest vs spec vs brief)
     local input_content
     local hash
-    hash=$(brief_hash "$INPUT_PATH")
 
-    if [[ "$INPUT_MODE" == "spec" ]]; then
+    if [[ "$INPUT_MODE" == "digest" ]]; then
+        # Digest mode: read structured digest instead of raw spec
+        hash=$(jq -r '.source_hash' "$DIGEST_DIR/index.json")
+
+        # Build digest content for planner prompt
+        local digest_content=""
+
+        # Conventions first (project-wide rules)
+        if [[ -f "$DIGEST_DIR/conventions.json" ]]; then
+            local conv_content
+            conv_content=$(cat "$DIGEST_DIR/conventions.json")
+            digest_content+="## Project Conventions (apply to ALL changes)
+$conv_content
+
+"
+        fi
+
+        # Data model reference
+        if [[ -f "$DIGEST_DIR/data-definitions.md" ]]; then
+            local data_content
+            data_content=$(cat "$DIGEST_DIR/data-definitions.md")
+            digest_content+="## Data Model Reference
+$data_content
+
+"
+        fi
+
+        # Execution hints (optional guidance)
+        local exec_hints
+        exec_hints=$(jq -r '.execution_hints // {} | if . == {} then empty else tostring end' "$DIGEST_DIR/index.json" 2>/dev/null || true)
+        if [[ -n "$exec_hints" ]]; then
+            digest_content+="## Execution Hints (optional guidance from spec author)
+$exec_hints
+
+"
+        fi
+
+        # Domain summaries
+        if [[ -d "$DIGEST_DIR/domains" ]]; then
+            digest_content+="## Domain Summaries
+"
+            for domain_file in "$DIGEST_DIR/domains"/*.md; do
+                [[ -f "$domain_file" ]] || continue
+                local dname
+                dname=$(basename "$domain_file" .md)
+                digest_content+="### $dname
+$(cat "$domain_file")
+
+"
+            done
+        fi
+
+        # Requirements
+        if [[ -f "$DIGEST_DIR/requirements.json" ]]; then
+            local reqs_content
+            reqs_content=$(cat "$DIGEST_DIR/requirements.json")
+            local req_count
+            req_count=$(echo "$reqs_content" | jq '.requirements | length')
+            digest_content+="## Requirements ($req_count total)
+$reqs_content
+
+"
+        fi
+
+        # Dependencies
+        if [[ -f "$DIGEST_DIR/dependencies.json" ]]; then
+            local deps_content
+            deps_content=$(cat "$DIGEST_DIR/dependencies.json")
+            digest_content+="## Cross-references
+$deps_content
+
+"
+        fi
+
+        # Ambiguities — only include deferred items that need planner resolution
+        if [[ -f "$DIGEST_DIR/ambiguities.json" ]]; then
+            local deferred_ambs
+            deferred_ambs=$(jq '{ambiguities: [.ambiguities[] | select(.resolution == "deferred" or (has("resolution") | not))]}' "$DIGEST_DIR/ambiguities.json" 2>/dev/null || echo '{"ambiguities":[]}')
+            local deferred_count
+            deferred_count=$(echo "$deferred_ambs" | jq '.ambiguities | length')
+            if [[ "$deferred_count" -gt 0 ]]; then
+                digest_content+="## Deferred Ambiguities ($deferred_count items — you MUST resolve each)
+For each deferred ambiguity below, include a \"resolved_ambiguities\" entry in the change that addresses the affected requirements. Specify your decision and rationale.
+
+$deferred_ambs
+
+"
+            fi
+        fi
+
+        input_content="$digest_content"
+    elif [[ "$INPUT_MODE" == "spec" ]]; then
+        hash=$(brief_hash "$INPUT_PATH")
         # Spec mode: check if summarization is needed
         local token_est
         token_est=$(estimate_tokens "$INPUT_PATH")
@@ -541,6 +816,7 @@ ${orch_mem}"
             input_content=$(cat "$INPUT_PATH")
         fi
     else
+        hash=$(brief_hash "$INPUT_PATH")
         input_content=$(cat "$INPUT_PATH")
     fi
 
@@ -587,8 +863,8 @@ $req_entries"
     fi
 
     local prompt
-    if [[ "$INPUT_MODE" == "spec" ]]; then
-        # Spec-mode prompt: LLM determines what's next
+    if [[ "$INPUT_MODE" == "spec" || "$INPUT_MODE" == "digest" ]]; then
+        # Spec/digest-mode prompt: LLM determines what's next
         local phase_instruction=""
         if [[ -n "$PHASE_HINT" ]]; then
             phase_instruction="The user requested phase: $PHASE_HINT. Focus decomposition on items matching this phase."
@@ -622,6 +898,18 @@ echo "$req_context"
 fi)
 
 ## $test_infra_context
+$(if [[ "${INPUT_MODE:-}" == "digest" && -f "$DIGEST_DIR/coverage.json" ]]; then
+    local cov_merged cov_running
+    cov_merged=$(jq -r '[.coverage | to_entries[] | select(.value.status == "merged") | .key] | join(", ")' "$DIGEST_DIR/coverage.json" 2>/dev/null || true)
+    cov_running=$(jq -r '[.coverage | to_entries[] | select(.value.status == "running") | .key] | join(", ")' "$DIGEST_DIR/coverage.json" 2>/dev/null || true)
+    if [[ -n "$cov_merged" || -n "$cov_running" ]]; then
+        echo ""
+        echo "## Coverage Status (from digest)"
+        [[ -n "$cov_merged" ]] && echo "Already covered (merged): $cov_merged"
+        [[ -n "$cov_running" ]] && echo "Already covered (running): $cov_running"
+        echo "Do NOT re-plan requirements that are already merged or running."
+    fi
+fi)
 $(if [[ -n "${_REPLAN_COMPLETED:-}" ]]; then
 cat <<REPLAN_CTX
 
@@ -645,6 +933,17 @@ Past operational events from previous cycles — use this to avoid repeating mis
 $_REPLAN_MEMORY
 ORCH_HIST
 fi)
+$(if [[ -n "${_REPLAN_E2E_FAILURES:-}" ]]; then
+cat <<E2E_CTX
+
+## Phase-End E2E Test Failures
+The previous phase's integrated E2E tests (Playwright) failed on main after all changes were merged.
+These are integration bugs that individual change tests did not catch.
+You MUST include fix changes for these failures in the next phase:
+
+$_REPLAN_E2E_FAILURES
+E2E_CTX
+fi)
 
 ## Task
 1. **Analyze the specification** — identify which items are completed (look for status markers: checkboxes, emoji, "done"/"implemented"/"kész"/"ready" text, strikethrough, progress tables) and which are pending. Also consider the "Already Completed" section above if present.
@@ -653,16 +952,30 @@ $phase_instruction
 3. **Decompose** the selected batch into concrete, implementable OpenSpec changes.
 
 Rules:
-- Each change should be completable in 1-3 Ralph loop sessions (not too large, not too granular)
+- Each change should be completable in 1 Ralph loop session (not too large, not too granular)
 - Use kebab-case names (e.g., add-user-auth, refactor-payment-flow)
 - Define dependencies: if change B needs code from change A, list A in depends_on
 - Changes with no dependencies can run in parallel
-- Complexity: S (< 10 tasks), M (10-25 tasks), L (25+ tasks)
+- Complexity: S (< 8 tasks, preferred), M (8-15 tasks, maximum). L (15+ tasks) is NOT ALLOWED — split into smaller changes.
+- Max 6 requirements per change. If a feature domain has more than 6 requirements, split it into sub-domain changes.
+- Scope text should be 800-1500 chars. If you need more than 2000 chars to describe a change, it is too large — split it.
 - Skip already-active changes listed above
 - Every change scope MUST include specific test requirements (happy path, error cases, security boundaries)
 - For security-related changes: include tenant isolation tests, auth guard tests
 - If no test infrastructure exists, the FIRST change MUST be "test-infrastructure-setup" setting up the test framework, config, helpers, and an example test. ALL other changes MUST depend on it.
 - If test infrastructure exists, follow existing test patterns (framework and naming conventions noted above)
+- NEVER create a standalone "e2e-consolidation", "playwright-e2e", or "e2e-tests" change that only writes E2E tests. This anti-pattern overloads one agent with all cross-feature tests and wastes tokens. Each feature change MUST include its OWN E2E tests inline.
+
+Sub-domain dependency chaining:
+- When splitting a large feature domain into multiple changes, those changes MUST form a depends_on chain (sequential execution within the domain)
+- Different domain chains can still run in parallel with each other
+- Example: splitting "product-catalog" (22 reqs) into product-list → product-detail → product-search — each depends_on the previous, but all can run in parallel with an unrelated "user-auth" chain
+
+Split heuristics for common patterns:
+- List page + detail page → split into separate changes if combined requirements exceed 6
+- CRUD operations → separate from read-only views when the domain is large
+- Search/filtering with its own API routes → separate change
+- Auth + profile + password management → split auth/login from profile/account management
 
 Dependency ordering heuristics — classify each change by type and apply ordering:
 - Classify each change as one of: infrastructure (test/build setup, CI), schema (DB migrations, model changes), foundational (auth, shared types, base components), feature (new functionality), cleanup-before (refactor/rename/reorganize existing code), cleanup-after (dead code removal, cosmetic fixes)
@@ -683,21 +996,29 @@ Test-per-change requirement:
 - The quality gate BLOCKS changes without test files for feature/infrastructure types.
 - Explicitly list test files in scope (e.g., "Tests: Create orders.test.ts").
 
-Functional test planning (when smoke_command is configured):
-- For each user-facing feature change, include a "Functional tests:" section in the scope with CONCRETE test scenarios:
+Playwright E2E test planning (when e2e_command is configured):
+- The infrastructure/foundation change (first in dependency order) MUST set up Playwright alongside Jest:
+  * Create playwright.config.ts with PW_PORT env var support and webServer auto-start
+  * Add testPathIgnorePatterns: ["/node_modules/", "/tests/e2e/"] to jest.config (Jest crashes on Playwright .spec.ts imports in jsdom)
+  * Add @playwright/test to devDependencies + run npx playwright install chromium
+  * Create tests/e2e/global-setup.ts: prisma generate → prisma db push --force-reset → prisma db seed
+- Each subsequent feature change creating a user-facing route MUST create tests/e2e/<feature>.spec.ts as an explicit file deliverable in scope (e.g., "Create tests/e2e/cart.spec.ts")
+- Include CONCRETE test scenarios per feature:
   * Page URL to visit
   * User interactions: what to click, what data to type, what to select
-  * Expected outcomes: visible text, redirects, error messages, DB state changes
-  * Auth scenarios: verify protected routes redirect unauthenticated users to login
+  * Expected outcomes: visible text, redirects, error messages
+  * Auth scenarios: verify protected routes redirect unauthenticated users
   * Error scenarios: invalid form input, missing required fields
-- Example:
-  Functional tests (tests/e2e/orders.spec.ts):
+  * COLD-VISIT test: navigate directly to the page as the FIRST action (no prior login, no add-to-cart, no session cookie). This catches Server Component cookie/session bugs where cookies().set() crashes outside a Server Action.
+- Example scope:
+  Create tests/e2e/orders.spec.ts:
+  - Cold visit: go to /cart directly (no prior actions) → should show empty state, NOT crash
   - Visit /products → click "Add to Cart" on first product → cart badge shows "1"
-  - Visit /cart → verify product name and price → click "Checkout" → fill name="Test User", email="test@test.com" → click "Place Order" → verify redirect to /orders/[id] with "Order confirmed"
+  - Visit /cart → verify product name and price → click "Checkout" → fill form → verify redirect to /orders/[id]
   - Visit /admin/orders without login → verify redirect to /admin/login
-  - Visit /admin/login → fill email="admin@test.com", password="admin123" → click "Sign in" → verify redirect to /admin
-- These tests run post-merge via smoke_command against a live dev server — they catch runtime bugs that mocked unit tests miss (cookies(), headers(), middleware, DB queries).
-- The last change may consolidate all E2E tests for cross-feature integration, but each preceding feature change must specify its own functional test scenarios.
+- Do NOT defer all E2E tests to a consolidation change — this overloads a single agent. Each feature change owns its tests.
+- Do NOT just list "Functional test scenarios:" as descriptions — create actual test files.
+- E2E tests run pre-merge in the worktree via e2e_command against an auto-started dev server with isolated port and DB.
 
 Model selection — suggest a model per change based on task nature:
 - "opus" for ALL changes that write functional code (features, bug fixes, refactors, cleanup, tests)
@@ -709,6 +1030,16 @@ Manual tasks — flag changes that require human intervention:
 - Set "has_manual_tasks": true when a change involves: external API keys/secrets (Stripe, AWS, Firebase), third-party account/project creation, OAuth app registration, DNS configuration, webhook setup, or any step that cannot be automated
 - Examples: "integrate Stripe payments" (needs API key), "set up Firebase auth" (needs project creation), "configure custom domain" (needs DNS records)
 - When false or omitted, all tasks are assumed automatable
+
+$(if [[ "$INPUT_MODE" == "digest" ]]; then
+cat <<'DIGEST_FIELDS'
+Digest-mode additional requirements:
+- Each change MUST include "spec_files": an array of raw spec file paths (relative to spec base dir) that this change needs for implementation. These files will be copied into the worktree.
+- Each change MUST include "requirements": an array of REQ-* IDs from the digest that this change owns and implements.
+- If a change must incorporate a cross-cutting requirement owned by another change, list it in "also_affects_reqs" (not in "requirements").
+- Every non-removed REQ-* ID in the digest MUST appear in exactly one change's "requirements" array. Cross-cutting requirements appear in one change's "requirements" (primary owner) and other changes' "also_affects_reqs".
+DIGEST_FIELDS
+fi)
 
 Output ONLY valid JSON (no markdown, no explanation):
 {
@@ -723,7 +1054,11 @@ Output ONLY valid JSON (no markdown, no explanation):
       "model": "opus|sonnet",
       "has_manual_tasks": false,
       "depends_on": ["other-change-name"],
-      "roadmap_item": "The spec section/item this implements"
+      "roadmap_item": "The spec section/item this implements"$(if [[ "$INPUT_MODE" == "digest" ]]; then echo ',
+      "spec_files": ["path/relative/to/spec-base-dir.md"],
+      "requirements": ["REQ-DOMAIN-001"],
+      "also_affects_reqs": ["REQ-CROSS-001"],
+      "resolved_ambiguities": [{"id": "AMB-001", "resolution_note": "Decision rationale"}]'; fi)
     }
   ]
 }
@@ -764,15 +1099,29 @@ fi)
 Analyze the "Next" section of the brief and decompose it into concrete, implementable OpenSpec changes.
 
 Rules:
-- Each change should be completable in 1-3 Ralph loop sessions (not too large, not too granular)
+- Each change should be completable in 1 Ralph loop session (not too large, not too granular)
 - Use kebab-case names (e.g., add-user-auth, refactor-payment-flow)
 - Define dependencies: if change B needs code from change A, list A in depends_on
 - Changes with no dependencies can run in parallel
-- Complexity: S (< 10 tasks), M (10-25 tasks), L (25+ tasks)
+- Complexity: S (< 8 tasks, preferred), M (8-15 tasks, maximum). L (15+ tasks) is NOT ALLOWED — split into smaller changes.
+- Max 6 requirements per change. If a feature domain has more than 6 requirements, split it into sub-domain changes.
+- Scope text should be 800-1500 chars. If you need more than 2000 chars to describe a change, it is too large — split it.
 - Every change scope MUST include specific test requirements (happy path, error cases, security boundaries)
 - For security-related changes: include tenant isolation tests, auth guard tests
 - If no test infrastructure exists, the FIRST change MUST be "test-infrastructure-setup" setting up the test framework, config, helpers, and an example test. ALL other changes MUST depend on it.
 - If test infrastructure exists, follow existing test patterns (framework and naming conventions noted above)
+- NEVER create a standalone "e2e-consolidation", "playwright-e2e", or "e2e-tests" change that only writes E2E tests. This anti-pattern overloads one agent with all cross-feature tests and wastes tokens. Each feature change MUST include its OWN E2E tests inline.
+
+Sub-domain dependency chaining:
+- When splitting a large feature domain into multiple changes, those changes MUST form a depends_on chain (sequential execution within the domain)
+- Different domain chains can still run in parallel with each other
+- Example: splitting "product-catalog" (22 reqs) into product-list → product-detail → product-search — each depends_on the previous, but all can run in parallel with an unrelated "user-auth" chain
+
+Split heuristics for common patterns:
+- List page + detail page → split into separate changes if combined requirements exceed 6
+- CRUD operations → separate from read-only views when the domain is large
+- Search/filtering with its own API routes → separate change
+- Auth + profile + password management → split auth/login from profile/account management
 
 Dependency ordering heuristics — classify each change by type and apply ordering:
 - Classify each change as one of: infrastructure (test/build setup, CI), schema (DB migrations, model changes), foundational (auth, shared types, base components), feature (new functionality), cleanup-before (refactor/rename/reorganize existing code), cleanup-after (dead code removal, cosmetic fixes)
@@ -793,21 +1142,29 @@ Test-per-change requirement:
 - The quality gate BLOCKS changes without test files for feature/infrastructure types.
 - Explicitly list test files in scope (e.g., "Tests: Create orders.test.ts").
 
-Functional test planning (when smoke_command is configured):
-- For each user-facing feature change, include a "Functional tests:" section in the scope with CONCRETE test scenarios:
+Playwright E2E test planning (when e2e_command is configured):
+- The infrastructure/foundation change (first in dependency order) MUST set up Playwright alongside Jest:
+  * Create playwright.config.ts with PW_PORT env var support and webServer auto-start
+  * Add testPathIgnorePatterns: ["/node_modules/", "/tests/e2e/"] to jest.config (Jest crashes on Playwright .spec.ts imports in jsdom)
+  * Add @playwright/test to devDependencies + run npx playwright install chromium
+  * Create tests/e2e/global-setup.ts: prisma generate → prisma db push --force-reset → prisma db seed
+- Each subsequent feature change creating a user-facing route MUST create tests/e2e/<feature>.spec.ts as an explicit file deliverable in scope (e.g., "Create tests/e2e/cart.spec.ts")
+- Include CONCRETE test scenarios per feature:
   * Page URL to visit
   * User interactions: what to click, what data to type, what to select
-  * Expected outcomes: visible text, redirects, error messages, DB state changes
-  * Auth scenarios: verify protected routes redirect unauthenticated users to login
+  * Expected outcomes: visible text, redirects, error messages
+  * Auth scenarios: verify protected routes redirect unauthenticated users
   * Error scenarios: invalid form input, missing required fields
-- Example:
-  Functional tests (tests/e2e/orders.spec.ts):
+  * COLD-VISIT test: navigate directly to the page as the FIRST action (no prior login, no add-to-cart, no session cookie). This catches Server Component cookie/session bugs where cookies().set() crashes outside a Server Action.
+- Example scope:
+  Create tests/e2e/orders.spec.ts:
+  - Cold visit: go to /cart directly (no prior actions) → should show empty state, NOT crash
   - Visit /products → click "Add to Cart" on first product → cart badge shows "1"
-  - Visit /cart → verify product name and price → click "Checkout" → fill name="Test User", email="test@test.com" → click "Place Order" → verify redirect to /orders/[id] with "Order confirmed"
+  - Visit /cart → verify product name and price → click "Checkout" → fill form → verify redirect to /orders/[id]
   - Visit /admin/orders without login → verify redirect to /admin/login
-  - Visit /admin/login → fill email="admin@test.com", password="admin123" → click "Sign in" → verify redirect to /admin
-- These tests run post-merge via smoke_command against a live dev server — they catch runtime bugs that mocked unit tests miss (cookies(), headers(), middleware, DB queries).
-- The last change may consolidate all E2E tests for cross-feature integration, but each preceding feature change must specify its own functional test scenarios.
+- Do NOT defer all E2E tests to a consolidation change — this overloads a single agent. Each feature change owns its tests.
+- Do NOT just list "Functional test scenarios:" as descriptions — create actual test files.
+- E2E tests run pre-merge in the worktree via e2e_command against an auto-started dev server with isolated port and DB.
 
 Model selection — suggest a model per change based on task nature:
 - "opus" for ALL changes that write functional code (features, bug fixes, refactors, cleanup, tests)
@@ -843,7 +1200,7 @@ PROMPT_EOF
     log_info "Plan decomposition started (brief hash: $hash)"
 
     local claude_output
-    claude_output=$(export RUN_CLAUDE_TIMEOUT=300; echo "$prompt" | run_claude --model "$(model_id opus)") || {
+    claude_output=$(export RUN_CLAUDE_TIMEOUT=1800; echo "$prompt" | run_claude --model "$(model_id opus)") || {
         error "Claude decomposition failed. Check your Claude CLI setup."
         log_error "Claude decomposition failed"
         return 1
@@ -952,6 +1309,21 @@ PYEOF
         error "Plan validation failed. Review $PLAN_FILENAME manually."
         return 1
     fi
+
+    # Populate coverage mapping for digest-mode plans
+    if [[ "$INPUT_MODE" == "digest" && -f "$DIGEST_DIR/requirements.json" ]]; then
+        if ! populate_coverage "$PLAN_FILENAME"; then
+            error "Plan validation failed: incomplete requirement coverage"
+            return 1
+        fi
+    fi
+
+    # Merge planner's ambiguity resolutions back into ambiguities.json
+    if [[ "$INPUT_MODE" == "digest" && -f "$DIGEST_DIR/ambiguities.json" ]]; then
+        merge_planner_resolutions "$DIGEST_DIR/ambiguities.json" "$PLAN_FILENAME"
+    fi
+
+    generate_report 2>/dev/null || true
 
     local change_count
     change_count=$(jq '.changes | length' "$PLAN_FILENAME")
@@ -1170,11 +1542,22 @@ $completed_file_context"
         export _REPLAN_MEMORY="${replan_memory:0:2000}"
     fi
 
+    # Inject phase-end E2E failure context if available (e2e_mode=phase_end)
+    local phase_e2e_ctx
+    phase_e2e_ctx=$(jq -r '.phase_e2e_failure_context // ""' "$STATE_FILENAME" 2>/dev/null)
+    if [[ -n "$phase_e2e_ctx" && "$phase_e2e_ctx" != '""' && "$phase_e2e_ctx" != "null" ]]; then
+        export _REPLAN_E2E_FAILURES="Phase-end E2E tests failed on the integrated codebase. These failures indicate integration issues that must be addressed in the next phase:
+
+$phase_e2e_ctx"
+    fi
+
     # Restore input path from plan so cmd_plan's find_input() can find it
     local plan_input_mode plan_input_path
     plan_input_mode=$(jq -r '.input_mode // empty' "$PLAN_FILENAME")
     plan_input_path=$(jq -r '.input_path // empty' "$PLAN_FILENAME")
     if [[ "$plan_input_mode" == "spec" && -n "$plan_input_path" ]]; then
+        SPEC_OVERRIDE="$plan_input_path"
+    elif [[ "$plan_input_mode" == "digest" && -n "$plan_input_path" ]]; then
         SPEC_OVERRIDE="$plan_input_path"
     elif [[ "$plan_input_mode" == "brief" && -n "$plan_input_path" ]]; then
         BRIEF_OVERRIDE="$plan_input_path"
@@ -1183,10 +1566,10 @@ $completed_file_context"
     if ! cmd_plan &>>"$LOG_FILE"; then
         log_error "Auto-replan failed — cmd_plan returned error"
         rm -f "$old_plan"
-        unset _REPLAN_COMPLETED _REPLAN_CYCLE _REPLAN_MEMORY
+        unset _REPLAN_COMPLETED _REPLAN_CYCLE _REPLAN_MEMORY _REPLAN_E2E_FAILURES
         return 2  # Error (distinct from 1=no new work)
     fi
-    unset _REPLAN_COMPLETED _REPLAN_CYCLE _REPLAN_MEMORY
+    unset _REPLAN_COMPLETED _REPLAN_CYCLE _REPLAN_MEMORY _REPLAN_E2E_FAILURES
 
     # Check if new plan has actionable changes not already completed
     local new_changes

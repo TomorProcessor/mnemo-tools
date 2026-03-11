@@ -9,24 +9,122 @@
 
 # Run tests in a worktree with timeout. Captures exit code + truncated output.
 # Returns 0 on pass, 1 on fail. Sets TEST_OUTPUT variable.
+# Args: wt_path, test_command, test_timeout, max_output_chars (default 2000)
 run_tests_in_worktree() {
     local wt_path="$1"
     local test_command="$2"
     local test_timeout="${3:-$DEFAULT_TEST_TIMEOUT}"
+    local max_chars="${4:-2000}"
 
     TEST_OUTPUT=""
     local raw_output rc=0
     raw_output=$(cd "$wt_path" && timeout "$test_timeout" bash -c "$test_command" 2>&1) || rc=$?
 
-    # Truncate output to 2000 chars
-    if [[ ${#raw_output} -gt 2000 ]]; then
+    # Truncate output to max_chars
+    if [[ ${#raw_output} -gt $max_chars ]]; then
         TEST_OUTPUT="...truncated...
-${raw_output: -2000}"
+${raw_output: -$max_chars}"
     else
         TEST_OUTPUT="$raw_output"
     fi
 
     return $rc
+}
+
+# ─── Requirement-Aware Review ────────────────────────────────────────
+
+# Build a prompt section listing assigned and cross-cutting requirements for a change.
+# Reads requirements[] and also_affects_reqs[] from state, looks up titles from digest.
+# Returns empty string if no requirements found, digest missing, or empty requirements[].
+# Args: change_name
+build_req_review_section() {
+    local change_name="$1"
+
+    # Check digest mode proxy
+    if [[ ! -f "$DIGEST_DIR/requirements.json" ]]; then
+        return 0
+    fi
+
+    # Read requirements from state
+    local reqs_json
+    reqs_json=$(jq -r --arg n "$change_name" \
+        '.changes[] | select(.name == $n) | .requirements // empty' "$STATE_FILENAME" 2>/dev/null || true)
+
+    # Empty or missing requirements → skip
+    if [[ -z "$reqs_json" || "$reqs_json" == "null" ]]; then
+        return 0
+    fi
+
+    local req_count
+    req_count=$(echo "$reqs_json" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "$req_count" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Build assigned requirements section
+    local section=""
+    section+="
+## Assigned Requirements (this change owns these)"
+
+    local req_ids
+    req_ids=$(echo "$reqs_json" | jq -r '.[]' 2>/dev/null || true)
+    while IFS= read -r req_id; do
+        [[ -z "$req_id" ]] && continue
+        local title brief
+        title=$(jq -r --arg id "$req_id" \
+            '.requirements[] | select(.id == $id) | .title // empty' "$DIGEST_DIR/requirements.json" 2>/dev/null || true)
+        brief=$(jq -r --arg id "$req_id" \
+            '.requirements[] | select(.id == $id) | .brief // empty' "$DIGEST_DIR/requirements.json" 2>/dev/null || true)
+        if [[ -z "$title" ]]; then
+            section+="
+- $req_id: (not found in digest)"
+            log_warn "build_req_review_section: $req_id not found in digest requirements.json"
+        else
+            section+="
+- $req_id: $title — $brief"
+        fi
+    done <<< "$req_ids"
+
+    # Build cross-cutting requirements section
+    local also_json
+    also_json=$(jq -r --arg n "$change_name" \
+        '.changes[] | select(.name == $n) | .also_affects_reqs // empty' "$STATE_FILENAME" 2>/dev/null || true)
+
+    if [[ -n "$also_json" && "$also_json" != "null" ]]; then
+        local also_count
+        also_count=$(echo "$also_json" | jq 'length' 2>/dev/null || echo 0)
+        if [[ "$also_count" -gt 0 ]]; then
+            section+="
+
+## Cross-Cutting Requirements (awareness only)"
+            local also_ids
+            also_ids=$(echo "$also_json" | jq -r '.[]' 2>/dev/null || true)
+            while IFS= read -r also_id; do
+                [[ -z "$also_id" ]] && continue
+                local also_title
+                also_title=$(jq -r --arg id "$also_id" \
+                    '.requirements[] | select(.id == $id) | .title // empty' "$DIGEST_DIR/requirements.json" 2>/dev/null || true)
+                if [[ -z "$also_title" ]]; then
+                    section+="
+- $also_id: (not found in digest)"
+                else
+                    section+="
+- $also_id: $also_title"
+                fi
+            done <<< "$also_ids"
+        fi
+    fi
+
+    # Add coverage check instruction
+    section+="
+
+## Requirement Coverage Check
+For each ASSIGNED requirement above, verify the diff contains implementation evidence.
+If a requirement has NO corresponding code in the diff, report:
+  ISSUE: [CRITICAL] REQ-ID has no implementation in the diff
+Cross-cutting requirements are for awareness — do not flag them as missing."
+
+    echo "$section"
 }
 
 # ─── Code Review ─────────────────────────────────────────────────────
@@ -55,6 +153,10 @@ review_change() {
 ...diff truncated at 30000 chars..."
     fi
 
+    # Build requirement-aware section (empty if not in digest mode)
+    local req_section
+    req_section=$(build_req_review_section "$change_name")
+
     local review_prompt
     review_prompt=$(cat <<REVIEW_EOF
 You are a senior code reviewer. Review this diff for critical issues.
@@ -66,6 +168,7 @@ $scope
 \`\`\`diff
 $diff_output
 \`\`\`
+$req_section
 
 ## Review Criteria
 Check for:
@@ -395,6 +498,100 @@ SCOPED_FIX_EOF
     return 1
 }
 
+# ─── Phase-End E2E ───────────────────────────────────────────────────
+# Run Playwright E2E tests on main after all changes in a phase have merged.
+# Results are stored in state for reporting and passed to replan as context.
+# Returns 0 regardless — failures don't block replan, they inform it.
+
+run_phase_end_e2e() {
+    local e2e_command="$1"
+    local e2e_timeout="${2:-180}"
+
+    log_info "Phase-end E2E: starting on main branch"
+    emit_event "PHASE_E2E_STARTED" "" "{}"
+
+    local e2e_port=$((3100 + RANDOM % 900))
+    local _start=$(($(date +%s%N) / 1000000))
+    local e2e_output=""
+    local e2e_rc=0
+    local e2e_result="pass"
+
+    # Screenshot output directory for this cycle
+    local cycle
+    cycle=$(jq '.replan_cycle // 0' "$STATE_FILENAME")
+    local screenshot_dir="wt/orchestration/e2e-screenshots/cycle-${cycle}"
+    mkdir -p "$screenshot_dir"
+
+    info "Running phase-end E2E tests on main (port=$e2e_port, screenshots=$screenshot_dir)..."
+
+    # Run E2E in project root (main branch) with Playwright screenshot/trace output
+    # PLAYWRIGHT_OUTPUT_DIR tells our run to save artifacts; consumer's playwright.config
+    # should respect this or use default test-results/
+    if PLAYWRIGHT_OUTPUT_DIR="$screenshot_dir" PW_PORT=$e2e_port run_tests_in_worktree "$(pwd)" "$e2e_command" "$e2e_timeout" 8000; then
+        e2e_output="$TEST_OUTPUT"
+        log_info "Phase-end E2E: all tests passed"
+    else
+        e2e_rc=$?
+        e2e_output="$TEST_OUTPUT"
+        e2e_result="fail"
+        log_error "Phase-end E2E: tests failed (rc=$e2e_rc)"
+    fi
+
+    # Cleanup dev server
+    pkill -f "pnpm dev.*--port $e2e_port" 2>/dev/null || true
+    pkill -f "next dev.*--port $e2e_port" 2>/dev/null || true
+
+    # Collect Playwright artifacts (screenshots, traces) into our output dir
+    # Playwright writes to test-results/ by default
+    if [[ -d "test-results" ]]; then
+        cp -r test-results/* "$screenshot_dir/" 2>/dev/null || true
+        log_info "Phase-end E2E: copied test-results/ to $screenshot_dir"
+    fi
+
+    local _elapsed=$(( $(date +%s%N) / 1000000 - _start ))
+    local screenshot_count
+    screenshot_count=$(find "$screenshot_dir" -name "*.png" 2>/dev/null | wc -l)
+    log_info "Phase-end E2E: took ${_elapsed}ms, result=$e2e_result, screenshots=$screenshot_count"
+
+    # Store results in state for reporting
+    local cycle
+    cycle=$(jq '.replan_cycle // 0' "$STATE_FILENAME")
+    local escaped_output
+    escaped_output=$(printf '%s' "$e2e_output" | head -c 8000 | jq -Rs .)
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg result "$e2e_result" \
+       --argjson ms "$_elapsed" \
+       --arg output "$escaped_output" \
+       --argjson cycle "$cycle" \
+       --arg screenshots "$screenshot_dir" \
+       --argjson sc_count "$screenshot_count" \
+       '.phase_e2e_results = (.phase_e2e_results // []) + [{
+            cycle: $cycle,
+            result: $result,
+            duration_ms: $ms,
+            output: $output,
+            screenshot_dir: $screenshots,
+            screenshot_count: $sc_count,
+            timestamp: (now | todate)
+        }]' "$STATE_FILENAME" > "$tmp" && mv "$tmp" "$STATE_FILENAME"
+
+    emit_event "PHASE_E2E_COMPLETED" "" "{\"result\":\"$e2e_result\",\"duration_ms\":$_elapsed,\"cycle\":$cycle}"
+
+    if [[ "$e2e_result" == "fail" ]]; then
+        send_notification "wt-orchestrate" "Phase-end E2E failed! Failures will be included in replan context." "warning"
+        # Store failure context for replan to consume
+        update_state_field "phase_e2e_failure_context" "$escaped_output"
+    else
+        send_notification "wt-orchestrate" "Phase-end E2E passed! All integrated tests green." "normal"
+        # Clear any previous failure context
+        update_state_field "phase_e2e_failure_context" '""'
+    fi
+
+    return 0
+}
+
 # ─── Poll Change ─────────────────────────────────────────────────────
 
 poll_change() {
@@ -412,6 +609,8 @@ poll_change() {
     local smoke_fix_max_turns="${12:-$DEFAULT_SMOKE_FIX_MAX_TURNS}"
     local smoke_health_check_url="${13:-}"
     local smoke_health_check_timeout="${14:-$DEFAULT_SMOKE_HEALTH_CHECK_TIMEOUT}"
+    local e2e_command="${15:-}"
+    local e2e_timeout="${16:-120}"
 
     local wt_path
     wt_path=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .worktree_path // empty' "$STATE_FILENAME")
@@ -452,8 +651,9 @@ poll_change() {
     cr_tok=$(jq -r '.total_cache_read // 0' "$loop_state" 2>/dev/null)
     cc_tok=$(jq -r '.total_cache_create // 0' "$loop_state" 2>/dev/null)
 
-    # If loop-state hasn't recorded tokens yet (mid-iteration), query wt-usage directly
-    if [[ "$tokens" -eq 0 && "$ralph_status" == "running" ]]; then
+    # If loop-state hasn't recorded tokens yet, query wt-usage directly
+    # Note: check regardless of ralph_status — loop may have finished with 0 in state
+    if [[ "$tokens" -eq 0 ]]; then
         local derived_dir loop_started
         derived_dir=$(echo "$wt_path" | sed 's|/|-|g')
         # Use loop-state started_at (current loop start), not orchestrator started_at
@@ -490,7 +690,8 @@ poll_change() {
                 "$test_timeout" "$max_verify_retries" "$review_before_merge" "$review_model" \
                 "$smoke_command" "$smoke_timeout" "$smoke_blocking" \
                 "$smoke_fix_max_retries" "$smoke_fix_max_turns" \
-                "$smoke_health_check_url" "$smoke_health_check_timeout"
+                "$smoke_health_check_url" "$smoke_health_check_timeout" \
+                "$e2e_command" "$e2e_timeout"
             ;;
         running)
             # Watchdog handles timeout/stall detection via watchdog_check() after poll_change().
@@ -564,7 +765,8 @@ poll_change() {
                     "$test_timeout" "$max_verify_retries" "$review_before_merge" "$review_model" \
                     "$smoke_command" "$smoke_timeout" "$smoke_blocking" \
                     "$smoke_fix_max_retries" "$smoke_fix_max_turns" \
-                    "$smoke_health_check_url" "$smoke_health_check_timeout"
+                    "$smoke_health_check_url" "$smoke_health_check_timeout" \
+                    "$e2e_command" "$e2e_timeout"
                 return
             fi
             # Mark stalled — watchdog handles escalation (resume, kill, fail)
@@ -593,6 +795,8 @@ handle_change_done() {
     local smoke_fix_max_turns="${13:-$DEFAULT_SMOKE_FIX_MAX_TURNS}"
     local smoke_health_check_url="${14:-}"
     local smoke_health_check_timeout="${15:-$DEFAULT_SMOKE_HEALTH_CHECK_TIMEOUT}"
+    local e2e_command="${16:-}"
+    local e2e_timeout="${17:-120}"
 
     log_info "Change $change_name completed, running checks... (review_before_merge=$review_before_merge, test_command=$test_command, test_timeout=$test_timeout)"
 
@@ -665,78 +869,8 @@ handle_change_done() {
     skip_test=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .skip_test // false' "$STATE_FILENAME")
     skip_review=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .skip_review // false' "$STATE_FILENAME")
 
-    # ── Step 1: Run tests if configured (VG-1) ──
-    local test_result="skip"
-    local test_output=""
-    if [[ "$skip_test" == "true" ]]; then
-        test_result="skipped"
-        log_info "Verify gate: tests skipped for $change_name (skip_test=true)"
-    elif [[ -n "$test_command" ]]; then
-        update_change_field "$change_name" "status" '"verifying"'
-        info "Running tests for $change_name..."
-        log_info "Verify gate: test start for $change_name"
-
-        local _t_start=$(($(date +%s%N) / 1000000))
-        if run_tests_in_worktree "$wt_path" "$test_command" "$test_timeout"; then
-            test_result="pass"
-            test_output="$TEST_OUTPUT"
-            log_info "Verify gate: tests passed for $change_name"
-            orch_remember "Tests passed for $change_name" Context "phase:test,change:$change_name"
-        else
-            test_result="fail"
-            test_output="$TEST_OUTPUT"
-            log_error "Verify gate: tests failed for $change_name"
-            orch_remember "Tests failed for $change_name: ${test_output:0:500}" Learning "phase:test,change:$change_name"
-        fi
-        gate_test_ms=$(( $(date +%s%N) / 1000000 - _t_start ))
-        update_change_field "$change_name" "gate_test_ms" "$gate_test_ms"
-        log_info "Verify gate: test took ${gate_test_ms}ms for $change_name"
-    fi
-
-    # Store test results in state (VG-5)
-    update_change_field "$change_name" "test_result" "\"$test_result\""
-    # Store truncated test output (escape for JSON)
-    local escaped_output
-    escaped_output=$(printf '%s' "$test_output" | head -c 2000 | jq -Rs .)
-    update_change_field "$change_name" "test_output" "$escaped_output"
-
-    if [[ "$test_result" == "fail" ]]; then
-        # Retry with test failure context (VG-2)
-        if [[ "$verify_retry_count" -lt "$max_verify_retries" ]]; then
-            verify_retry_count=$((verify_retry_count + 1))
-            info "Tests failed for $change_name — retrying ($verify_retry_count/$max_verify_retries)..."
-            log_info "Verify gate: test fail retry $verify_retry_count/$max_verify_retries for $change_name"
-            update_change_field "$change_name" "verify_retry_count" "$verify_retry_count"
-            update_change_field "$change_name" "status" '"verify-failed"'
-
-            # Resume Ralph with test failure context
-            local scope
-            scope=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .scope // ""' "$STATE_FILENAME")
-            local retry_prompt="Tests failed after implementation. Fix the failing tests.\n\nTest command: $test_command\nTest output:\n$test_output\n\nOriginal scope: $scope"
-            # Recall relevant memories for retry context
-            local _mem_ctx
-            _mem_ctx=$(orch_recall "$scope" 3 "phase:verification")
-            if [[ -n "$_mem_ctx" ]]; then
-                retry_prompt="$retry_prompt\n\n## Context from Memory\n${_mem_ctx:0:1000}"
-            fi
-            update_change_field "$change_name" "retry_context" "$(printf '%s' "$retry_prompt" | jq -Rs .)"
-            # Snapshot tokens before retry for cost tracking
-            local _snap_tokens
-            _snap_tokens=$(jq -r '.total_tokens // 0' "$wt_path/.claude/loop-state.json" 2>/dev/null || echo "0")
-            update_change_field "$change_name" "retry_tokens_start" "$_snap_tokens"
-            update_change_field "$change_name" "gate_test_ms" "$gate_test_ms"
-            resume_change "$change_name"
-            return
-        fi
-        update_change_field "$change_name" "status" '"failed"'
-        send_notification "wt-orchestrate" "Change '$change_name' failed tests after $max_verify_retries retries" "critical"
-        log_error "Verify gate: $change_name failed tests permanently"
-        trigger_checkpoint "failure"
-        return
-    fi
-
-    # ── Step 2: Build verification — cheap, no LLM cost (VG-BUILD) ──
-    # Run build BEFORE expensive LLM review/verify to catch failures early and save tokens
+    # ── Step 1: Build verification — cheapest check, no LLM cost (VG-BUILD) ──
+    # Build runs FIRST: catches type errors (~10s) before running tests (~5s+) or E2E (~30s+)
     local gate_build_ms=0
     local build_command=""
     if [[ -f "$wt_path/package.json" ]]; then
@@ -851,7 +985,181 @@ handle_change_done() {
         update_change_field "$change_name" "build_result" '"pass"'
     fi
 
-    # ── Step 2a: Pre-merge implementation scope check (BLOCKING) ──
+    # ── Step 2: Run tests if configured (VG-1) ──
+    local test_result="skip"
+    local test_output=""
+    if [[ "$skip_test" == "true" ]]; then
+        test_result="skipped"
+        log_info "Verify gate: tests skipped for $change_name (skip_test=true)"
+    elif [[ -n "$test_command" ]]; then
+        update_change_field "$change_name" "status" '"verifying"'
+        info "Running tests for $change_name..."
+        log_info "Verify gate: test start for $change_name"
+
+        local _t_start=$(($(date +%s%N) / 1000000))
+        if run_tests_in_worktree "$wt_path" "$test_command" "$test_timeout"; then
+            test_result="pass"
+            test_output="$TEST_OUTPUT"
+            log_info "Verify gate: tests passed for $change_name"
+            orch_remember "Tests passed for $change_name" Context "phase:test,change:$change_name"
+        else
+            test_result="fail"
+            test_output="$TEST_OUTPUT"
+            log_error "Verify gate: tests failed for $change_name"
+            orch_remember "Tests failed for $change_name: ${test_output:0:500}" Learning "phase:test,change:$change_name"
+        fi
+        gate_test_ms=$(( $(date +%s%N) / 1000000 - _t_start ))
+        update_change_field "$change_name" "gate_test_ms" "$gate_test_ms"
+        log_info "Verify gate: test took ${gate_test_ms}ms for $change_name"
+    fi
+
+    # Store test results in state (VG-5)
+    update_change_field "$change_name" "test_result" "\"$test_result\""
+    # Store truncated test output (escape for JSON)
+    local escaped_output
+    escaped_output=$(printf '%s' "$test_output" | head -c 2000 | jq -Rs .)
+    update_change_field "$change_name" "test_output" "$escaped_output"
+
+    # Parse test counts from output (Jest/Vitest/Playwright formats)
+    local t_passed=0 t_failed=0 t_suites=0 t_type="unknown"
+    if [[ -n "$test_output" ]]; then
+        # Jest/Vitest: "Tests:  X passed, Y total" or "Tests:  X failed, Y passed, Z total"
+        local jest_passed jest_failed
+        jest_passed=$(echo "$test_output" | grep -oP 'Tests:\s+.*?(\d+)\s+passed' | grep -oP '\d+(?=\s+passed)' | tail -1 || true)
+        jest_failed=$(echo "$test_output" | grep -oP 'Tests:\s+.*?(\d+)\s+failed' | grep -oP '\d+(?=\s+failed)' | tail -1 || true)
+        local jest_suites
+        jest_suites=$(echo "$test_output" | grep -oP 'Test Suites:\s+.*?(\d+)\s+passed' | grep -oP '\d+(?=\s+passed)' | tail -1 || true)
+
+        # Playwright: "X passed" or "X failed, Y passed"
+        local pw_passed pw_failed
+        pw_passed=$(echo "$test_output" | grep -oP '\d+(?=\s+passed)' | tail -1 || true)
+        pw_failed=$(echo "$test_output" | grep -oP '\d+(?=\s+failed)' | tail -1 || true)
+
+        if [[ -n "$jest_passed" ]]; then
+            t_passed=$jest_passed; t_failed=${jest_failed:-0}; t_suites=${jest_suites:-0}; t_type="jest"
+        elif [[ -n "$pw_passed" ]]; then
+            t_passed=$pw_passed; t_failed=${pw_failed:-0}; t_type="playwright"
+        fi
+
+        if [[ "$((t_passed + t_failed))" -gt 0 ]]; then
+            update_change_field "$change_name" "test_stats" \
+                "{\"passed\":$t_passed,\"failed\":$t_failed,\"suites\":$t_suites,\"type\":\"$t_type\"}"
+        fi
+    fi
+
+    if [[ "$test_result" == "fail" ]]; then
+        # Retry with test failure context (VG-2)
+        if [[ "$verify_retry_count" -lt "$max_verify_retries" ]]; then
+            verify_retry_count=$((verify_retry_count + 1))
+            info "Tests failed for $change_name — retrying ($verify_retry_count/$max_verify_retries)..."
+            log_info "Verify gate: test fail retry $verify_retry_count/$max_verify_retries for $change_name"
+            update_change_field "$change_name" "verify_retry_count" "$verify_retry_count"
+            update_change_field "$change_name" "status" '"verify-failed"'
+
+            # Resume Ralph with test failure context
+            local scope
+            scope=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .scope // ""' "$STATE_FILENAME")
+            local retry_prompt="Tests failed after implementation. Fix the failing tests.\n\nTest command: $test_command\nTest output:\n$test_output\n\nOriginal scope: $scope"
+            # Recall relevant memories for retry context
+            local _mem_ctx
+            _mem_ctx=$(orch_recall "$scope" 3 "phase:verification")
+            if [[ -n "$_mem_ctx" ]]; then
+                retry_prompt="$retry_prompt\n\n## Context from Memory\n${_mem_ctx:0:1000}"
+            fi
+            update_change_field "$change_name" "retry_context" "$(printf '%s' "$retry_prompt" | jq -Rs .)"
+            # Snapshot tokens before retry for cost tracking
+            local _snap_tokens
+            _snap_tokens=$(jq -r '.total_tokens // 0' "$wt_path/.claude/loop-state.json" 2>/dev/null || echo "0")
+            update_change_field "$change_name" "retry_tokens_start" "$_snap_tokens"
+            update_change_field "$change_name" "gate_test_ms" "$gate_test_ms"
+            resume_change "$change_name"
+            return
+        fi
+        update_change_field "$change_name" "status" '"failed"'
+        send_notification "wt-orchestrate" "Change '$change_name' failed tests after $max_verify_retries retries" "critical"
+        log_error "Verify gate: $change_name failed tests permanently"
+        trigger_checkpoint "failure"
+        return
+    fi
+
+    # ── Step 3: E2E tests — Playwright functional tests in worktree (VG-E2E) ──
+    local gate_e2e_ms=0
+    local e2e_result="skip"
+    local e2e_output=""
+    if [[ -n "$e2e_command" ]]; then
+        # Check both: playwright config exists AND there are actual test files
+        local e2e_test_count=0
+        e2e_test_count=$(find "$wt_path/tests/e2e" -name "*.spec.ts" -o -name "*.spec.js" 2>/dev/null | wc -l || echo 0)
+        if [[ (-f "$wt_path/playwright.config.ts" || -f "$wt_path/playwright.config.js") && "$e2e_test_count" -gt 0 ]]; then
+            update_change_field "$change_name" "status" '"verifying"'
+            local e2e_port=$((3100 + RANDOM % 900))
+            info "Running E2E tests for $change_name (port=$e2e_port)..."
+            log_info "Verify gate: e2e start for $change_name (PW_PORT=$e2e_port)"
+
+            local _e_start=$(($(date +%s%N) / 1000000))
+            if PW_PORT=$e2e_port run_tests_in_worktree "$wt_path" "$e2e_command" "$e2e_timeout" 4000; then
+                e2e_result="pass"
+                e2e_output="$TEST_OUTPUT"
+                log_info "Verify gate: e2e passed for $change_name"
+            else
+                e2e_result="fail"
+                e2e_output="$TEST_OUTPUT"
+                log_error "Verify gate: e2e failed for $change_name"
+            fi
+            # Always cleanup dev server — prevents zombie processes holding ports
+            pkill -f "pnpm dev.*--port $e2e_port" 2>/dev/null || true
+            pkill -f "next dev.*--port $e2e_port" 2>/dev/null || true
+            gate_e2e_ms=$(( $(date +%s%N) / 1000000 - _e_start ))
+            update_change_field "$change_name" "gate_e2e_ms" "$gate_e2e_ms"
+            log_info "Verify gate: e2e took ${gate_e2e_ms}ms for $change_name"
+        else
+            e2e_result="skipped"
+            if [[ "$e2e_test_count" -eq 0 ]]; then
+                log_warn "Verify gate: e2e skipped for $change_name (no .spec.ts files in tests/e2e/)"
+            else
+                log_warn "Verify gate: e2e skipped for $change_name (no playwright.config.ts)"
+            fi
+        fi
+    fi
+
+    # Store e2e results in state
+    update_change_field "$change_name" "e2e_result" "\"$e2e_result\""
+    local escaped_e2e_output
+    escaped_e2e_output=$(printf '%s' "$e2e_output" | head -c 4000 | jq -Rs .)
+    update_change_field "$change_name" "e2e_output" "$escaped_e2e_output"
+
+    if [[ "$e2e_result" == "fail" ]]; then
+        if [[ "$verify_retry_count" -lt "$max_verify_retries" ]]; then
+            verify_retry_count=$((verify_retry_count + 1))
+            info "E2E tests failed for $change_name — retrying ($verify_retry_count/$max_verify_retries)..."
+            log_info "Verify gate: e2e fail retry $verify_retry_count/$max_verify_retries for $change_name"
+            update_change_field "$change_name" "verify_retry_count" "$verify_retry_count"
+            update_change_field "$change_name" "status" '"verify-failed"'
+
+            local scope
+            scope=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .scope // ""' "$STATE_FILENAME")
+            local retry_prompt="E2E tests (Playwright) failed after implementation. Fix the failing E2E tests or the code they test.\n\nE2E command: $e2e_command\nE2E output:\n$e2e_output\n\nOriginal scope: $scope"
+            local _mem_ctx
+            _mem_ctx=$(orch_recall "$scope" 3 "phase:verification")
+            if [[ -n "$_mem_ctx" ]]; then
+                retry_prompt="$retry_prompt\n\n## Context from Memory\n${_mem_ctx:0:1000}"
+            fi
+            update_change_field "$change_name" "retry_context" "$(printf '%s' "$retry_prompt" | jq -Rs .)"
+            local _snap_tokens
+            _snap_tokens=$(jq -r '.total_tokens // 0' "$wt_path/.claude/loop-state.json" 2>/dev/null || echo "0")
+            update_change_field "$change_name" "retry_tokens_start" "$_snap_tokens"
+            update_change_field "$change_name" "gate_e2e_ms" "$gate_e2e_ms"
+            resume_change "$change_name"
+            return
+        fi
+        update_change_field "$change_name" "status" '"failed"'
+        send_notification "wt-orchestrate" "Change '$change_name' failed E2E tests after $max_verify_retries retries" "critical"
+        log_error "Verify gate: $change_name failed E2E permanently"
+        trigger_checkpoint "failure"
+        return
+    fi
+
+    # ── Step 4: Pre-merge implementation scope check (BLOCKING) ──
     if ! verify_implementation_scope "$change_name" "$wt_path"; then
         update_change_field "$change_name" "scope_check" '"fail"'
         log_error "Verify gate: scope check FAILED for $change_name — no implementation files"
@@ -877,7 +1185,7 @@ handle_change_done() {
     fi
     update_change_field "$change_name" "scope_check" '"pass"'
 
-    # ── Step 2b: Check for test file existence (BLOCKING for feature types) ──
+    # ── Step 4b: Check for test file existence (BLOCKING for feature types) ──
     local test_files_count=0
     test_files_count=$(cd "$wt_path" && git diff --name-only "$(git merge-base HEAD origin/HEAD 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD~5)..HEAD" 2>/dev/null | grep -cE '\.(test|spec)\.' || true)
     if [[ "$test_files_count" -eq 0 ]]; then
@@ -917,7 +1225,7 @@ handle_change_done() {
         update_change_field "$change_name" "has_tests" "true"
     fi
 
-    # ── Step 3: LLM Code Review (VG-4) ──
+    # ── Step 5: LLM Code Review (VG-4) ──
     if [[ "$skip_review" == "true" ]]; then
         update_change_field "$change_name" "review_result" '"skipped"'
         log_info "Verify gate: review skipped for $change_name (skip_review=true)"
@@ -946,7 +1254,15 @@ handle_change_done() {
                 update_change_field "$change_name" "verify_retry_count" "$verify_retry_count"
                 update_change_field "$change_name" "status" '"verify-failed"'
                 # Build retry context with review feedback
-                local retry_prompt="Code review found CRITICAL issues. Fix these issues.\n\nReview feedback:\n${REVIEW_OUTPUT:0:500}\n\nOriginal scope: $scope"
+                # Extract specific REQ-IDs flagged as CRITICAL for structured retry
+                local flagged_reqs
+                flagged_reqs=$(echo "$REVIEW_OUTPUT" | grep -oE 'REQ-[A-Z0-9]+-[0-9]+' | sort -u | tr '\n' ', ' || true)
+                local retry_prompt
+                if [[ -n "$flagged_reqs" ]]; then
+                    retry_prompt="Code review found CRITICAL issues — requirements with no implementation evidence: $flagged_reqs\n\nImplement them or explain why they are already covered.\n\nReview feedback:\n${REVIEW_OUTPUT:0:500}\n\nOriginal scope: $scope"
+                else
+                    retry_prompt="Code review found CRITICAL issues. Fix these issues.\n\nReview feedback:\n${REVIEW_OUTPUT:0:500}\n\nOriginal scope: $scope"
+                fi
                 # Recall relevant memories for retry context
                 local _mem_ctx
                 _mem_ctx=$(orch_recall "$scope" 3 "phase:verification")
@@ -973,7 +1289,7 @@ handle_change_done() {
         orch_remember "Code review passed for $change_name — no critical issues" Context "phase:review,change:$change_name"
     fi
 
-    # ── Step 3.5: Project verification rules ──
+    # ── Step 5b: Project verification rules ──
     if ! evaluate_verification_rules "$change_name" "$wt_path"; then
         log_error "Verification rules failed for $change_name — blocking merge"
         update_change_field "$change_name" "status" '"verify-failed"'
@@ -988,7 +1304,7 @@ handle_change_done() {
         return
     fi
 
-    # ── Step 4: Run verify step (existing) ──
+    # ── Step 6: Run verify step (existing) ──
     info "Running verify for $change_name..."
     local _v_start=$(($(date +%s%N) / 1000000))
     local verify_ok=true
@@ -1020,13 +1336,13 @@ handle_change_done() {
     fi
 
     # ── Store gate total ──
-    local gate_total_ms=$((gate_test_ms + gate_review_ms + gate_verify_ms + gate_build_ms))
+    local gate_total_ms=$((gate_test_ms + gate_e2e_ms + gate_review_ms + gate_verify_ms + gate_build_ms))
     update_change_field "$change_name" "gate_total_ms" "$gate_total_ms"
     local gate_retry_tokens
     gate_retry_tokens=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .gate_retry_tokens // 0' "$STATE_FILENAME")
     local gate_retry_count
     gate_retry_count=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .gate_retry_count // 0' "$STATE_FILENAME")
-    log_info "Verify gate: $change_name total ${gate_total_ms}ms (test=${gate_test_ms}ms, build=${gate_build_ms}ms, review=${gate_review_ms}ms, verify=${gate_verify_ms}ms, retries=${gate_retry_count}, retry_tokens=${gate_retry_tokens})"
+    log_info "Verify gate: $change_name total ${gate_total_ms}ms (build=${gate_build_ms}ms, test=${gate_test_ms}ms, review=${gate_review_ms}ms, verify=${gate_verify_ms}ms, retries=${gate_retry_count}, retry_tokens=${gate_retry_tokens})"
     emit_event "VERIFY_GATE" "$change_name" "$(jq -cn \
         --arg test "$test_result" \
         --argjson test_ms "$gate_test_ms" \
@@ -1045,7 +1361,7 @@ handle_change_done() {
         return
     fi
 
-    # ── Step 5: Mark done and handle merge ──
+    # ── Step 7: Mark done and handle merge ──
     update_change_field "$change_name" "status" '"done"'
     update_change_field "$change_name" "completed_at" "\"$(date -Iseconds)\""
     log_info "Change $change_name done (tests: $test_result, review: $([[ "$review_before_merge" == "true" ]] && echo "pass" || echo "skipped"), verify: ok)"

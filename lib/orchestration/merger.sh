@@ -60,6 +60,7 @@ merge_change() {
         info "Already handled: $change_name (branch $source_branch no longer exists)"
         log_info "Skipping merge for $change_name — branch deleted (assumed merged)"
         update_change_field "$change_name" "status" '"merged"'
+        update_coverage_status "$change_name" "merged" 2>/dev/null || true
         cleanup_worktree "$change_name" "$wt_path"
         archive_change "$change_name"
         local tmp
@@ -75,6 +76,7 @@ merge_change() {
         info "Already merged: $change_name (branch $source_branch is ancestor of HEAD)"
         log_info "Skipping merge for $change_name — already merged"
         update_change_field "$change_name" "status" '"merged"'
+        update_coverage_status "$change_name" "merged" 2>/dev/null || true
         cleanup_worktree "$change_name" "$wt_path"
         archive_change "$change_name"
         local tmp
@@ -86,8 +88,12 @@ merge_change() {
     # Case 3: Normal merge (with LLM conflict resolution)
     if wt-merge "$change_name" --no-push --llm-resolve >>"$LOG_FILE" 2>&1; then
         update_change_field "$change_name" "status" '"merged"'
+        update_coverage_status "$change_name" "merged" 2>/dev/null || true
         log_info "Merged $change_name"
         success "Merged: $change_name"
+
+        # Sync running worktrees with updated main to prevent stale-main gate failures
+        _sync_running_worktrees "$change_name"
 
         # Invalidate base build cache — merge changes main, old result is stale
         BASE_BUILD_STATUS=""
@@ -331,6 +337,7 @@ SMOKE_FIX_EOF
             log_info "No real conflict markers for $change_name — retrying merge"
             if wt-merge "$change_name" --no-push --llm-resolve >>"$LOG_FILE" 2>&1; then
                 update_change_field "$change_name" "status" '"merged"'
+                update_coverage_status "$change_name" "merged" 2>/dev/null || true
                 return 0
             fi
             log_warn "wt-merge failed for $change_name but no conflict markers — marking merge-blocked"
@@ -363,6 +370,31 @@ SMOKE_FIX_EOF
             return 1
         fi
     fi
+}
+
+# ─── Post-Merge Sync ─────────────────────────────────────────────────
+
+# Sync all running worktrees with main after a merge to prevent stale-main gate failures.
+# Non-blocking: sync failures are logged but do not affect the merge result.
+_sync_running_worktrees() {
+    local merged_change="$1"
+
+    local running_changes
+    running_changes=$(jq -r '.changes[] | select(.status == "running") | .name' "$STATE_FILENAME" 2>/dev/null || true)
+    [[ -z "$running_changes" ]] && return 0
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local wt_path
+        wt_path=$(jq -r --arg n "$name" '.changes[] | select(.name == $n) | .worktree_path // empty' "$STATE_FILENAME" 2>/dev/null)
+        [[ -z "$wt_path" || ! -d "$wt_path" ]] && continue
+
+        if sync_worktree_with_main "$wt_path" "$name" 2>/dev/null; then
+            log_info "Post-merge sync: $name synced with main (after $merged_change merge)"
+        else
+            log_warn "Post-merge sync: $name sync failed (non-blocking)"
+        fi
+    done <<< "$running_changes"
 }
 
 # ─── Worktree Cleanup ────────────────────────────────────────────────

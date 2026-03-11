@@ -105,6 +105,12 @@ find_brief() {
 find_input() {
     # --spec takes priority
     if [[ -n "$SPEC_OVERRIDE" ]]; then
+        # Directory input → digest mode
+        if [[ -d "$SPEC_OVERRIDE" ]]; then
+            INPUT_MODE="digest"
+            INPUT_PATH="$(cd "$SPEC_OVERRIDE" && pwd)"
+            return 0
+        fi
         if [[ -f "$SPEC_OVERRIDE" ]]; then
             INPUT_MODE="spec"
             INPUT_PATH="$(cd "$(dirname "$SPEC_OVERRIDE")" && pwd)/$(basename "$SPEC_OVERRIDE")"
@@ -652,9 +658,13 @@ resolve_directives() {
     local input_file="$1"
 
     # Level 4: defaults (built into parse_directives)
-    # Level 3: in-document directives
+    # Level 3: in-document directives (skip for directory specs — no embedded directives)
     local doc_directives
-    doc_directives=$(parse_directives "$input_file")
+    if [[ -d "$input_file" ]]; then
+        doc_directives=$(parse_directives /dev/null)
+    else
+        doc_directives=$(parse_directives "$input_file")
+    fi
 
     # Level 2: config file
     local config_directives

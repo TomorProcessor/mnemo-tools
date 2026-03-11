@@ -112,10 +112,22 @@ watchdog_check() {
 
     local should_escalate=false
 
-    # Loop detection triggers escalation
+    # Loop detection triggers escalation (but only if Ralph PID is dead)
     if [[ "$consecutive_same" -ge "$WATCHDOG_LOOP_THRESHOLD" ]]; then
-        log_warn "Watchdog: $change_name stuck in loop ($consecutive_same identical hashes)"
-        should_escalate=true
+        local ralph_pid_loop
+        ralph_pid_loop=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .ralph_pid // 0' "$STATE_FILENAME")
+        if [[ "$ralph_pid_loop" -gt 0 ]] && kill -0 "$ralph_pid_loop" 2>/dev/null; then
+            # PID alive = long operation, not stuck — warn but don't escalate
+            # Throttle: log + event at threshold, then every 20th occurrence to reduce noise
+            if [[ "$consecutive_same" -eq "$WATCHDOG_LOOP_THRESHOLD" || $((consecutive_same % 20)) -eq 0 ]]; then
+                log_debug "Watchdog: $change_name hash loop ($consecutive_same identical hashes) but PID $ralph_pid_loop alive — skipping escalation"
+                emit_event "WATCHDOG_WARN" "$change_name" \
+                    "{\"reason\":\"hash_loop_pid_alive\",\"consecutive\":$consecutive_same,\"pid\":$ralph_pid_loop}"
+            fi
+        else
+            log_warn "Watchdog: $change_name stuck in loop ($consecutive_same identical hashes, PID $ralph_pid_loop dead)"
+            should_escalate=true
+        fi
     fi
 
     # Timeout triggers escalation (but only if Ralph PID is dead)
@@ -262,10 +274,10 @@ _watchdog_check_progress() {
         failed|paused|waiting:budget) return 0 ;;
     esac
 
-    # Guard: skip if loop already done
+    # Guard: skip if loop already done or waiting for API recovery
     local loop_status
     loop_status=$(jq -r '.status // "unknown"' "$loop_state_file" 2>/dev/null)
-    if [[ "$loop_status" == "done" ]]; then
+    if [[ "$loop_status" == "done" || "$loop_status" == "waiting:api" ]]; then
         return 0
     fi
 
@@ -317,13 +329,22 @@ _watchdog_check_progress() {
     fi
 
     if [[ "$all_no_op" == "true" ]]; then
-        # Spinning: all no_op=true AND no commits → fail
-        log_error "Watchdog: $change_name spinning — $tail_count consecutive no-op iterations, failing"
-        emit_event "WATCHDOG_NO_PROGRESS" "$change_name" \
-            "{\"pattern\":\"spinning\",\"action\":\"fail\",\"iterations\":$tail_count}"
-        _watchdog_salvage_partial_work "$change_name"
-        update_change_field "$change_name" "status" '"failed"'
-        send_notification "wt-orchestrate" "Watchdog: '$change_name' spinning — $tail_count consecutive no-op iterations, failing" "critical"
+        # Spinning: all no_op=true AND no commits → redispatch or fail
+        local redispatch_count_spin
+        redispatch_count_spin=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .redispatch_count // 0' "$STATE_FILENAME")
+        if [[ "$redispatch_count_spin" -lt "${MAX_REDISPATCH:-2}" ]]; then
+            log_error "Watchdog: $change_name spinning — $tail_count consecutive no-op iterations, redispatching (attempt $((redispatch_count_spin + 1))/${MAX_REDISPATCH:-2})"
+            emit_event "WATCHDOG_NO_PROGRESS" "$change_name" \
+                "{\"pattern\":\"spinning\",\"action\":\"redispatch\",\"iterations\":$tail_count}"
+            redispatch_change "$change_name" "spinning"
+        else
+            log_error "Watchdog: $change_name spinning — $tail_count consecutive no-op iterations, max redispatches exhausted, failing"
+            emit_event "WATCHDOG_NO_PROGRESS" "$change_name" \
+                "{\"pattern\":\"spinning\",\"action\":\"fail\",\"iterations\":$tail_count,\"redispatch_count\":$redispatch_count_spin}"
+            _watchdog_salvage_partial_work "$change_name"
+            update_change_field "$change_name" "status" '"failed"'
+            send_notification "wt-orchestrate" "Watchdog: '$change_name' spinning — max redispatches ($redispatch_count_spin) exhausted, failing" "critical"
+        fi
     else
         # Stuck: no commits but some iterations had no_op=false → pause
         log_warn "Watchdog: $change_name stuck — $tail_count iterations without commits, pausing"
@@ -350,18 +371,19 @@ _watchdog_escalate() {
             resume_change "$change_name" || true
             ;;
         3)
-            log_error "Watchdog: $change_name escalation level 3 — killing and resuming"
-            emit_event "WATCHDOG_KILL" "$change_name" "{\"level\":3}"
-            # Kill Ralph PID
-            local ralph_pid
-            ralph_pid=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .ralph_pid // 0' "$STATE_FILENAME")
-            if [[ "$ralph_pid" -gt 0 ]] && kill -0 "$ralph_pid" 2>/dev/null; then
-                kill -TERM "$ralph_pid" 2>/dev/null || true
-                sleep 2
-                kill -0 "$ralph_pid" 2>/dev/null && kill -KILL "$ralph_pid" 2>/dev/null || true
-                log_info "Watchdog: killed Ralph PID $ralph_pid for $change_name"
+            # L3: redispatch if attempts remain, otherwise fall through to fail
+            local redispatch_count_l3
+            redispatch_count_l3=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .redispatch_count // 0' "$STATE_FILENAME")
+            if [[ "$redispatch_count_l3" -lt "${MAX_REDISPATCH:-2}" ]]; then
+                log_error "Watchdog: $change_name escalation level 3 — redispatching (attempt $((redispatch_count_l3 + 1))/${MAX_REDISPATCH:-2})"
+                redispatch_change "$change_name" "escalation"
+            else
+                log_error "Watchdog: $change_name escalation level 3 — max redispatches exhausted, failing"
+                _watchdog_salvage_partial_work "$change_name"
+                emit_event "WATCHDOG_FAILED" "$change_name" "{\"level\":3,\"reason\":\"max_redispatch_exhausted\",\"redispatch_count\":$redispatch_count_l3}"
+                update_change_field "$change_name" "status" '"failed"'
+                send_notification "wt-orchestrate" "Watchdog: '$change_name' failed — max redispatches ($redispatch_count_l3) exhausted at L3" "critical"
             fi
-            resume_change "$change_name" || true
             ;;
         *)
             # Level 4+: give up — salvage partial work first

@@ -42,6 +42,13 @@ monitor_loop() {
     local smoke_health_check_timeout
     smoke_health_check_timeout=$(echo "$directives" | jq -r ".smoke_health_check_timeout // $DEFAULT_SMOKE_HEALTH_CHECK_TIMEOUT")
 
+    local e2e_command
+    e2e_command=$(echo "$directives" | jq -r '.e2e_command // ""')
+    local e2e_timeout
+    e2e_timeout=$(echo "$directives" | jq -r '.e2e_timeout // 120')
+    local e2e_mode
+    e2e_mode=$(echo "$directives" | jq -r '.e2e_mode // "per_change"')
+
     local token_hard_limit
     token_hard_limit=$(echo "$directives" | jq -r ".token_hard_limit // $DEFAULT_TOKEN_HARD_LIMIT")
 
@@ -55,6 +62,8 @@ monitor_loop() {
     wd_loop_thresh=$(echo "$directives" | jq -r '.watchdog_loop_threshold // empty')
     [[ -n "$wd_timeout" ]] && WATCHDOG_TIMEOUT_RUNNING="$wd_timeout" && WATCHDOG_TIMEOUT_VERIFYING="$wd_timeout" && WATCHDOG_TIMEOUT_DISPATCHED="$wd_timeout"
     [[ -n "$wd_loop_thresh" ]] && WATCHDOG_LOOP_THRESHOLD="$wd_loop_thresh"
+    # Max redispatch attempts per change (default: 2)
+    MAX_REDISPATCH=$(echo "$directives" | jq -r '.max_redispatch // 2')
     # Apply context pruning directive to global
     CONTEXT_PRUNING=$(echo "$directives" | jq -r '.context_pruning // true')
 
@@ -130,7 +139,10 @@ monitor_loop() {
             send_notification "wt-orchestrate" "Time limit reached ($(format_duration "$active_seconds") active). Run 'wt-orchestrate start' to continue." "normal"
             orch_memory_stats
             orch_gate_stats
-            send_summary_email "time-limit" "$(basename "$(pwd)")" "$STATE_FILENAME" 2>/dev/null || true
+            local _cov_summary
+            _cov_summary=$(final_coverage_check 2>/dev/null || true)
+            send_summary_email "time-limit" "$(basename "$(pwd)")" "$STATE_FILENAME" "$_cov_summary" 2>/dev/null || true
+            generate_report 2>/dev/null || true
             break
         fi
 
@@ -138,6 +150,8 @@ monitor_loop() {
         local orch_status
         orch_status=$(jq -r '.status' "$STATE_FILENAME" 2>/dev/null || echo "unknown")
         if [[ "$orch_status" == "stopped" || "$orch_status" == "done" ]]; then
+            final_coverage_check 2>/dev/null || true
+            generate_report 2>/dev/null || true
             break
         fi
         # Skip monitoring if paused or at checkpoint
@@ -146,6 +160,10 @@ monitor_loop() {
         fi
 
         # Poll each active change (running + verifying — verifying may have been interrupted mid-gate)
+        # In phase_end mode, skip per-change E2E (runs on main after all changes merge)
+        local _poll_e2e_cmd="$e2e_command"
+        [[ "$e2e_mode" == "phase_end" ]] && _poll_e2e_cmd=""
+
         local active_changes
         active_changes=$(jq -r '.changes[]? | select(.status == "running" or .status == "verifying") | .name' "$STATE_FILENAME" 2>/dev/null || true)
         while IFS= read -r name; do
@@ -154,7 +172,8 @@ monitor_loop() {
                 "$test_timeout" "$max_verify_retries" "$review_before_merge" "$review_model" \
                 "$smoke_command" "$smoke_timeout" "$smoke_blocking" \
                 "$smoke_fix_max_retries" "$smoke_fix_max_turns" \
-                "$smoke_health_check_url" "$smoke_health_check_timeout"
+                "$smoke_health_check_url" "$smoke_health_check_timeout" \
+                "$_poll_e2e_cmd" "$e2e_timeout"
             watchdog_check "$name"
         done <<< "$active_changes"
 
@@ -178,7 +197,8 @@ monitor_loop() {
                         "$test_timeout" "$max_verify_retries" "$review_before_merge" "$review_model" \
                         "$smoke_command" "$smoke_timeout" "$smoke_blocking" \
                         "$smoke_fix_max_retries" "$smoke_fix_max_turns" \
-                        "$smoke_health_check_url" "$smoke_health_check_timeout"
+                        "$smoke_health_check_url" "$smoke_health_check_timeout" \
+                        "$_poll_e2e_cmd" "$e2e_timeout"
                 fi
             fi
         done <<< "$suspended_changes"
@@ -249,6 +269,9 @@ monitor_loop() {
         # Resume stalled changes after cooldown (handles rate limit recovery)
         resume_stalled_changes
 
+        # Cascade failure: mark pending changes whose dependencies have failed
+        cascade_failed_deps
+
         # Retry failed builds before declaring all-done (cheaper than replan)
         retry_failed_builds "$max_verify_retries"
 
@@ -278,34 +301,58 @@ monitor_loop() {
             fi
         fi
 
+        # Update HTML report
+        generate_report 2>/dev/null || true
+
         # Watchdog heartbeat (sentinel monitors events.jsonl mtime)
         watchdog_heartbeat
 
-        # Check if checkpoint needed
-        local changes_since
-        changes_since=$(jq -r '.changes_since_checkpoint // 0' "$STATE_FILENAME")
-        if [[ "$changes_since" -ge "$checkpoint_every" ]]; then
-            trigger_checkpoint "periodic"
-            continue
+        # Check if checkpoint needed (skip if checkpoint_every is null/empty/0)
+        if [[ -n "$checkpoint_every" && "$checkpoint_every" != "null" && "$checkpoint_every" -gt 0 ]] 2>/dev/null; then
+            local changes_since
+            changes_since=$(jq -r '.changes_since_checkpoint // 0' "$STATE_FILENAME")
+            if [[ "$changes_since" -ge "$checkpoint_every" ]]; then
+                trigger_checkpoint "periodic"
+                continue
+            fi
         fi
 
-        # Check if all done — only merged/done count as complete, not merge-blocked/failed
+        # Check if all done — count resolved changes (success + terminal failures)
         local total_changes
         total_changes=$(jq '.changes | length' "$STATE_FILENAME")
         local truly_complete
-        truly_complete=$(jq '[.changes[] | select(.status == "done" or .status == "merged")] | length' "$STATE_FILENAME")
+        truly_complete=$(jq '[.changes[] | select(.status == "done" or .status == "merged" or .status == "skipped")] | length' "$STATE_FILENAME")
+        local failed_count
+        failed_count=$(jq '[.changes[] | select(.status == "failed")] | length' "$STATE_FILENAME")
+        local skipped_count
+        skipped_count=$(jq '[.changes[] | select(.status == "skipped")] | length' "$STATE_FILENAME")
         local merge_blocked_count
         merge_blocked_count=$(jq '[.changes[] | select(.status == "merge-blocked")] | length' "$STATE_FILENAME")
         local active_count
         active_count=$(jq '[.changes[] | select(.status == "running" or .status == "pending" or .status == "verifying" or .status == "stalled")] | length' "$STATE_FILENAME")
 
-        if [[ "$active_count" -eq 0 && "$merge_blocked_count" -gt 0 ]]; then
-            log_info "$truly_complete changes complete, $merge_blocked_count merge-blocked — not triggering replan"
+        # When no active changes remain but some are merge-blocked/failed,
+        # nothing can unblock them — transition to done with partial completion
+        if [[ "$active_count" -eq 0 && "$truly_complete" -lt "$total_changes" ]]; then
+            local terminal_count=$((truly_complete + failed_count + merge_blocked_count))
+            if [[ "$terminal_count" -ge "$total_changes" ]]; then
+                local skip_msg=""
+                [[ "$skipped_count" -gt 0 ]] && skip_msg=", $skipped_count skipped"
+                log_info "$truly_complete succeeded$skip_msg, $failed_count failed, $merge_blocked_count merge-blocked — all resolved"
+                send_notification "wt-orchestrate" "$truly_complete/$total_changes changes complete ($failed_count failed$skip_msg, $merge_blocked_count merge-blocked)" "warning"
+                # Fall through to completion handling below
+            fi
         fi
 
-        if [[ "$truly_complete" -ge "$total_changes" ]]; then
+        local all_resolved=$(( truly_complete + failed_count + merge_blocked_count ))
+        if [[ "$truly_complete" -ge "$total_changes" || ("$active_count" -eq 0 && "$all_resolved" -ge "$total_changes") ]]; then
             log_info "All $total_changes changes complete"
             send_notification "wt-orchestrate" "All $total_changes changes complete!" "normal"
+
+            # ── Phase-end E2E: run Playwright on main after all changes merged ──
+            if [[ "$e2e_mode" == "phase_end" && -n "$e2e_command" && "$truly_complete" -gt 0 ]]; then
+                run_phase_end_e2e "$e2e_command" "$e2e_timeout"
+            fi
 
             # Auto-replan: generate next plan and continue if new work found
             if [[ "$auto_replan" == "true" ]]; then
@@ -342,7 +389,10 @@ monitor_loop() {
                     cleanup_all_worktrees
                     orch_memory_stats
                     orch_gate_stats
-                    send_summary_email "complete" "$(basename "$(pwd)")" "$STATE_FILENAME" 2>/dev/null || true
+                    local _cov_summary
+                    _cov_summary=$(final_coverage_check 2>/dev/null || true)
+                    send_summary_email "complete" "$(basename "$(pwd)")" "$STATE_FILENAME" "$_cov_summary" 2>/dev/null || true
+                    generate_report 2>/dev/null || true
                     success "All work complete! No more phases to implement."
                     log_info "Auto-replan found no new work — orchestration complete"
                     break
@@ -362,7 +412,10 @@ monitor_loop() {
                         update_state_field "status" '"done"'
                         update_state_field "replan_exhausted" 'true'
                         update_state_field "replan_attempt" "0"
-                        send_summary_email "replan-exhausted" "$(basename "$(pwd)")" "$STATE_FILENAME" 2>/dev/null || true
+                        local _cov_summary
+                        _cov_summary=$(final_coverage_check 2>/dev/null || true)
+                        send_summary_email "replan-exhausted" "$(basename "$(pwd)")" "$STATE_FILENAME" "$_cov_summary" 2>/dev/null || true
+                        generate_report 2>/dev/null || true
                         break
                     fi
                     warn "Replan failed (cycle $cycle, attempt $replan_retry_count/$MAX_REPLAN_RETRIES) — will retry"
@@ -377,7 +430,10 @@ monitor_loop() {
                 success "All changes complete!"
                 orch_memory_stats
                 orch_gate_stats
-                send_summary_email "complete" "$(basename "$(pwd)")" "$STATE_FILENAME" 2>/dev/null || true
+                local _cov_summary
+                _cov_summary=$(final_coverage_check 2>/dev/null || true)
+                send_summary_email "complete" "$(basename "$(pwd)")" "$STATE_FILENAME" "$_cov_summary" 2>/dev/null || true
+                generate_report 2>/dev/null || true
                 log_info "Orchestration complete"
                 break
             fi

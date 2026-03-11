@@ -385,7 +385,121 @@ MEMORY_EOF
 - Full spec available via: \`cat $INPUT_PATH\`
 SPECREF_EOF
             fi
+
+            # Digest mode: add spec context references and requirement IDs to proposal
+            if [[ "${INPUT_MODE:-}" == "digest" ]]; then
+                local digest_dir="$project_path/$DIGEST_DIR"
+
+                # Add Source Specifications section (spec files copied to worktree)
+                local spec_files_list
+                spec_files_list=$(jq -r --arg n "$change_name" \
+                    '.changes[] | select(.name == $n) | .spec_files[]? // empty' "$STATE_FILENAME" 2>/dev/null || true)
+                if [[ -n "$spec_files_list" ]]; then
+                    echo "" >> "$proposal_path"
+                    echo "## Source Specifications" >> "$proposal_path"
+                    echo "Read these for detailed requirements:" >> "$proposal_path"
+                    while IFS= read -r sf; do
+                        [[ -z "$sf" ]] && continue
+                        echo "- \`.claude/spec-context/$sf\`" >> "$proposal_path"
+                    done <<< "$spec_files_list"
+                fi
+
+                # Add Requirements section
+                local change_reqs
+                change_reqs=$(jq -r --arg n "$change_name" \
+                    '.changes[] | select(.name == $n) | .requirements[]? // empty' "$STATE_FILENAME" 2>/dev/null || true)
+                if [[ -n "$change_reqs" && -f "$digest_dir/requirements.json" ]]; then
+                    echo "" >> "$proposal_path"
+                    echo "## Requirements" >> "$proposal_path"
+                    echo "This change covers:" >> "$proposal_path"
+                    while IFS= read -r rid; do
+                        [[ -z "$rid" ]] && continue
+                        local rtitle rbrief
+                        rtitle=$(jq -r --arg id "$rid" '.requirements[] | select(.id == $id) | .title // ""' "$digest_dir/requirements.json" 2>/dev/null || true)
+                        rbrief=$(jq -r --arg id "$rid" '.requirements[] | select(.id == $id) | .brief // ""' "$digest_dir/requirements.json" 2>/dev/null || true)
+                        echo "- $rid: $rtitle — $rbrief" >> "$proposal_path"
+                    done <<< "$change_reqs"
+                fi
+
+                # Add Cross-Cutting Requirements section
+                local also_affects
+                also_affects=$(jq -r --arg n "$change_name" \
+                    '.changes[] | select(.name == $n) | .also_affects_reqs[]? // empty' "$STATE_FILENAME" 2>/dev/null || true)
+                if [[ -n "$also_affects" && -f "$digest_dir/requirements.json" ]]; then
+                    echo "" >> "$proposal_path"
+                    echo "## Cross-Cutting Requirements" >> "$proposal_path"
+                    echo "These requirements are owned by other changes — incorporate their constraints, do not re-implement from scratch:" >> "$proposal_path"
+                    while IFS= read -r rid; do
+                        [[ -z "$rid" ]] && continue
+                        local rtitle rbrief
+                        rtitle=$(jq -r --arg id "$rid" '.requirements[] | select(.id == $id) | .title // ""' "$digest_dir/requirements.json" 2>/dev/null || true)
+                        rbrief=$(jq -r --arg id "$rid" '.requirements[] | select(.id == $id) | .brief // ""' "$digest_dir/requirements.json" 2>/dev/null || true)
+                        echo "- $rid: $rtitle — $rbrief" >> "$proposal_path"
+                    done <<< "$also_affects"
+                fi
+            fi
+
             log_info "Pre-created proposal.md for $change_name"
+        fi
+
+        # Digest mode: copy spec files to worktree .claude/spec-context/
+        if [[ "${INPUT_MODE:-}" == "digest" ]]; then
+            local digest_dir="$project_path/$DIGEST_DIR"
+            if [[ -f "$digest_dir/index.json" ]]; then
+                local spec_base_dir
+                spec_base_dir=$(jq -r '.spec_base_dir' "$digest_dir/index.json")
+
+                # Copy change-specific spec files
+                local spec_files_json
+                spec_files_json=$(jq -r --arg n "$change_name" \
+                    '.changes[] | select(.name == $n) | .spec_files[]? // empty' "$STATE_FILENAME" 2>/dev/null || true)
+                if [[ -n "$spec_files_json" ]]; then
+                    mkdir -p ".claude/spec-context"
+                    while IFS= read -r sf; do
+                        [[ -z "$sf" ]] && continue
+                        local src_file="$spec_base_dir/$sf"
+                        if [[ -f "$src_file" ]]; then
+                            local target_dir=".claude/spec-context/$(dirname "$sf")"
+                            mkdir -p "$target_dir"
+                            cp "$src_file" "$target_dir/"
+                        else
+                            log_warn "Spec file not found: $src_file"
+                        fi
+                    done <<< "$spec_files_json"
+                fi
+
+                # Copy conventions.json and data-definitions.md to every worktree
+                if [[ -f "$digest_dir/conventions.json" ]]; then
+                    mkdir -p ".claude/spec-context"
+                    cp "$digest_dir/conventions.json" ".claude/spec-context/"
+                fi
+                if [[ -f "$digest_dir/data-definitions.md" ]]; then
+                    mkdir -p ".claude/spec-context"
+                    cp "$digest_dir/data-definitions.md" ".claude/spec-context/"
+                fi
+
+                # Add .claude/spec-context/ to .gitignore
+                if [[ -f ".gitignore" ]]; then
+                    if ! grep -qxF '.claude/spec-context/' ".gitignore" 2>/dev/null; then
+                        echo '.claude/spec-context/' >> ".gitignore"
+                    fi
+                else
+                    echo '.claude/spec-context/' > ".gitignore"
+                fi
+            fi
+        fi
+
+        # Inject retry_context into proposal for redispatched changes
+        local retry_ctx
+        retry_ctx=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .retry_context // empty' "$STATE_FILENAME")
+        if [[ -n "$retry_ctx" && "$retry_ctx" != "null" ]]; then
+            local proposal_path="openspec/changes/$change_name/proposal.md"
+            if [[ -f "$proposal_path" ]]; then
+                printf '\n%s\n' "$retry_ctx" >> "$proposal_path"
+                log_info "Injected retry_context into proposal for $change_name"
+            fi
+            # Clear retry_context after injection
+            update_change_field "$change_name" "retry_context" "null"
         fi
 
         # Check artifact readiness — if tasks.md exists, agent can go straight to apply
@@ -405,6 +519,9 @@ SPECREF_EOF
     update_change_field "$change_name" "status" '"dispatched"'
     update_change_field "$change_name" "worktree_path" "\"$wt_path\""
     update_change_field "$change_name" "started_at" "\"$(date -Iseconds)\""
+
+    # Update coverage status → dispatched
+    update_coverage_status "$change_name" "dispatched" 2>/dev/null || true
 
     # Pre-dispatch hook
     if ! run_hook "pre_dispatch" "$change_name" "dispatched" "$wt_path"; then
@@ -460,6 +577,9 @@ dispatch_via_wt_loop() {
     update_change_field "$change_name" "ralph_pid" "${terminal_pid:-0}"
     update_change_field "$change_name" "status" '"running"'
     log_info "Ralph started for $change_name in $wt_path (terminal PID ${terminal_pid:-unknown})"
+
+    # Update coverage status → running
+    update_coverage_status "$change_name" "running" 2>/dev/null || true
 }
 
 # Resume changes that were running when the orchestrator was interrupted.
@@ -495,19 +615,41 @@ dispatch_ready_changes() {
     local order
     order=$(topological_sort "$PLAN_FILENAME" 2>/dev/null || true)
 
+    # Collect ready-to-dispatch changes, then sort by complexity (L first)
+    local ready_names=()
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
-        [[ "$running" -ge "$max_parallel" ]] && break
 
         local status
         status=$(get_change_status "$name")
         [[ "$status" != "pending" ]] && continue
 
         if deps_satisfied "$name"; then
-            dispatch_change "$name"
-            running=$((running + 1))
+            ready_names+=("$name")
         fi
     done <<< "$order"
+
+    # Sort ready changes: L > M > S (larger first to reduce tail latency)
+    if [[ ${#ready_names[@]} -gt 1 ]]; then
+        local sorted_names=()
+        for priority in L M S; do
+            for name in "${ready_names[@]}"; do
+                local complexity
+                complexity=$(jq -r --arg n "$name" '.changes[] | select(.name == $n) | .complexity // "M"' "$STATE_FILENAME" 2>/dev/null)
+                if [[ "$complexity" == "$priority" ]]; then
+                    sorted_names+=("$name")
+                fi
+            done
+        done
+        ready_names=("${sorted_names[@]}")
+    fi
+
+    # Dispatch in priority order
+    for name in "${ready_names[@]}"; do
+        [[ "$running" -ge "$max_parallel" ]] && break
+        dispatch_change "$name"
+        running=$((running + 1))
+    done
 }
 
 pause_change() {
@@ -659,6 +801,100 @@ resume_stalled_changes() {
     done <<< "$stalled"
 }
 
+# Redispatch a stuck change to a fresh worktree.
+# Kills Ralph, salvages partial work, builds retry_context, cleans up worktree,
+# resets watchdog state, sets status to pending for natural re-dispatch.
+redispatch_change() {
+    local change_name="$1"
+    local failure_pattern="${2:-stuck}"  # spinning|stuck|timeout
+
+    local wt_path
+    wt_path=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .worktree_path // empty' "$STATE_FILENAME")
+    local tokens_used
+    tokens_used=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .tokens_used // 0' "$STATE_FILENAME")
+    local redispatch_count
+    redispatch_count=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .redispatch_count // 0' "$STATE_FILENAME")
+
+    log_info "Redispatching $change_name (attempt $((redispatch_count + 1))/${MAX_REDISPATCH:-2}, pattern=$failure_pattern)"
+
+    # 1. Kill Ralph PID
+    local ralph_pid
+    ralph_pid=$(jq -r --arg n "$change_name" '.changes[] | select(.name == $n) | .ralph_pid // 0' "$STATE_FILENAME")
+    if [[ "$ralph_pid" -gt 0 ]] && kill -0 "$ralph_pid" 2>/dev/null; then
+        kill -TERM "$ralph_pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$ralph_pid" 2>/dev/null && kill -KILL "$ralph_pid" 2>/dev/null || true
+        log_info "Redispatch: killed Ralph PID $ralph_pid for $change_name"
+    fi
+
+    # 2. Salvage partial work (captures diff + file list in state)
+    _watchdog_salvage_partial_work "$change_name"
+
+    # 3. Build retry_context from failure info
+    local partial_files
+    partial_files=$(jq -r --arg n "$change_name" \
+        '.changes[] | select(.name == $n) | .partial_diff_files // [] | join(", ")' "$STATE_FILENAME" 2>/dev/null || true)
+    local iter_count=0
+    if [[ -n "$wt_path" && -f "$wt_path/.claude/loop-state.json" ]]; then
+        iter_count=$(jq '[.iterations // [] | length] | .[0]' "$wt_path/.claude/loop-state.json" 2>/dev/null || echo 0)
+    fi
+
+    local retry_prompt
+    retry_prompt="## Previous Attempt Failed (redispatch ${redispatch_count}/$((redispatch_count + 1)))
+
+Failure pattern: $failure_pattern
+Iterations completed: $iter_count
+Tokens used: $tokens_used
+
+Files modified in failed attempt: $partial_files
+
+Start fresh — do not repeat the same approach that led to $failure_pattern."
+
+    update_change_field "$change_name" "retry_context" "$(printf '%s' "$retry_prompt" | jq -Rs .)"
+
+    # 4. Increment redispatch_count
+    local new_count=$((redispatch_count + 1))
+    update_change_field "$change_name" "redispatch_count" "$new_count"
+
+    # 5. Emit event
+    emit_event "WATCHDOG_REDISPATCH" "$change_name" \
+        "{\"redispatch_count\":$new_count,\"failure_pattern\":\"$failure_pattern\",\"tokens_used\":$tokens_used,\"iterations\":$iter_count}"
+
+    # 6. Clean up old worktree
+    if [[ -n "$wt_path" && -d "$wt_path" ]]; then
+        local branch_name
+        branch_name=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+        git worktree remove --force "$wt_path" 2>/dev/null || {
+            log_warn "Redispatch: git worktree remove failed for $wt_path, trying rm"
+            rm -rf "$wt_path"
+        }
+        if [[ -n "$branch_name" && "$branch_name" != "HEAD" ]]; then
+            git branch -D "$branch_name" 2>/dev/null || true
+        fi
+        log_info "Redispatch: cleaned up worktree $wt_path"
+    fi
+
+    # 7. Reset watchdog sub-object
+    local tmp
+    tmp=$(mktemp)
+    jq --arg n "$change_name" \
+        '(.changes[] | select(.name == $n) | .watchdog) = {
+            last_activity_epoch: (now | floor),
+            action_hash_ring: [],
+            consecutive_same_hash: 0,
+            escalation_level: 0
+        }' "$STATE_FILENAME" > "$tmp" && mv "$tmp" "$STATE_FILENAME"
+
+    # 8. Clear worktree-specific fields and set status to pending
+    update_change_field "$change_name" "worktree_path" "null"
+    update_change_field "$change_name" "ralph_pid" "null"
+    update_change_field "$change_name" "status" '"pending"'
+
+    send_notification "wt-orchestrate" \
+        "Redispatching '$change_name' ($failure_pattern, attempt $new_count/${MAX_REDISPATCH:-2})" "normal"
+    log_info "Redispatch complete for $change_name — status set to pending"
+}
+
 # Retry failed builds: give build failures a chance to self-repair
 # before triggering a full replan cycle.
 retry_failed_builds() {
@@ -692,6 +928,9 @@ retry_failed_builds() {
 # ─── Command Handlers ────────────────────────────────────────────────
 
 cmd_start() {
+    # In automated mode, auto-defer untriaged ambiguities instead of pausing
+    export TRIAGE_AUTO_DEFER=true
+
     # Auto-plan if no plan exists or CLI --spec/--brief differs from plan's input
     local need_plan=false
     if [[ ! -f "$PLAN_FILENAME" ]]; then
@@ -707,7 +946,10 @@ cmd_start() {
         # short names like "v12" → wt/orchestration/specs/v12.md, relative paths → absolute
         local resolved_cli="$cli_input"
         if [[ -n "$SPEC_OVERRIDE" ]]; then
-            if [[ -f "$cli_input" ]]; then
+            if [[ -d "$cli_input" ]]; then
+                # Directory spec (digest mode)
+                resolved_cli="$(cd "$cli_input" && pwd)"
+            elif [[ -f "$cli_input" ]]; then
                 resolved_cli="$(cd "$(dirname "$cli_input")" && pwd)/$(basename "$cli_input")"
             else
                 # Try short-name resolution: wt/orchestration/specs/<name>.md
@@ -734,11 +976,22 @@ cmd_start() {
             # Same path — check if content changed since last plan
             local plan_hash current_hash
             plan_hash=$(jq -r '.input_hash // ""' "$PLAN_FILENAME" 2>/dev/null)
-            current_hash=$(sha256sum "$resolved_cli" 2>/dev/null | cut -d' ' -f1)
-            if [[ -n "$plan_hash" && -n "$current_hash" && "$plan_hash" != "$current_hash" ]]; then
-                info "Spec content changed since last plan — replanning"
-                log_info "Content hash mismatch: plan=$plan_hash current=$current_hash"
-                need_plan=true
+            if [[ -d "$resolved_cli" ]]; then
+                # Directory spec: use digest freshness check
+                local freshness
+                freshness=$(check_digest_freshness "$resolved_cli" 2>/dev/null || echo "missing")
+                if [[ "$freshness" != "fresh" ]]; then
+                    info "Spec directory changed since last digest — replanning"
+                    log_info "Digest freshness: $freshness for $resolved_cli"
+                    need_plan=true
+                fi
+            else
+                current_hash=$(sha256sum "$resolved_cli" 2>/dev/null | cut -d' ' -f1)
+                if [[ -n "$plan_hash" && -n "$current_hash" && "$plan_hash" != "$current_hash" ]]; then
+                    info "Spec content changed since last plan — replanning"
+                    log_info "Content hash mismatch: plan=$plan_hash current=$current_hash"
+                    need_plan=true
+                fi
             fi
         fi
     fi
@@ -799,11 +1052,11 @@ cmd_start() {
             update_state_field "status" '"running"'
 
             # Restore input path from plan
-            if [[ -z "${INPUT_PATH:-}" || ! -f "${INPUT_PATH:-}" ]]; then
+            if [[ -z "${INPUT_PATH:-}" || ! -e "${INPUT_PATH:-}" ]]; then
                 INPUT_MODE=$(jq -r '.input_mode // empty' "$PLAN_FILENAME")
                 INPUT_PATH=$(jq -r '.input_path // empty' "$PLAN_FILENAME")
-                if [[ -z "$INPUT_PATH" || ! -f "$INPUT_PATH" ]]; then
-                    error "Cannot find input file from plan: $INPUT_PATH"
+                if [[ -z "$INPUT_PATH" || ! -e "$INPUT_PATH" ]]; then
+                    error "Cannot find input from plan: $INPUT_PATH"
                     return 1
                 fi
             fi
@@ -830,7 +1083,7 @@ cmd_start() {
                 fi
                 if [[ "$current_status" == "done" ]]; then
                     log_info "Orchestrator exiting normally (status=done)"
-                    return
+                    exit 0
                 fi
                 echo ""
                 warn "Orchestrator interrupted, saving state..."
@@ -866,11 +1119,11 @@ cmd_start() {
     log_info "Orchestration started"
 
     # Restore input path from plan (so --spec is not needed again)
-    if [[ -z "${INPUT_PATH:-}" || ! -f "${INPUT_PATH:-}" ]]; then
+    if [[ -z "${INPUT_PATH:-}" || ! -e "${INPUT_PATH:-}" ]]; then
         INPUT_MODE=$(jq -r '.input_mode // empty' "$PLAN_FILENAME")
         INPUT_PATH=$(jq -r '.input_path // empty' "$PLAN_FILENAME")
-        if [[ -z "$INPUT_PATH" || ! -f "$INPUT_PATH" ]]; then
-            error "Cannot find input file from plan: $INPUT_PATH"
+        if [[ -z "$INPUT_PATH" || ! -e "$INPUT_PATH" ]]; then
+            error "Cannot find input from plan: $INPUT_PATH"
             error "Re-run with --spec or --brief, or regenerate the plan."
             return 1
         fi
