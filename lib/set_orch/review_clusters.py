@@ -20,4 +20,10 @@ REVIEW_PATTERN_CLUSTERS: dict[str, list[str]] = {
     "missing-validation": ["input validation", "accepts negative", "zod validation",
                            "no validation", "missing validation"],
     "open-redirect": ["open redirect", "redirect vulnerability"],
+    "i18n-hardcoded": ["hardcoded string", "hardcoded text", "hardcoded ui",
+                        "untranslated", "missing translation", "missing i18n",
+                        "usetranslations", "no i18n", "literal string",
+                        "translation key", "i18n keys"],
+    "ui-image": ["raw <img>", "<img>", "img tag", "img element",
+                  "next/image", "image optimization"],
 }

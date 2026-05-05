@@ -14,10 +14,14 @@ paths:
 Before declaring your change done (i.e. before `complete` / last commit), you MUST run:
 
 ```bash
-pnpm tsx scripts/check-i18n-completeness.ts
+pnpm check:i18n
 ```
 
+(equivalent to `pnpm tsx scripts/check-i18n-completeness.ts`)
+
 The script exits non-zero if ANY `t('key')` call in the code you touched has no matching entry in BOTH `messages/en.json` AND `messages/hu.json` (or the change's per-locale sidecar `messages/<locale>.<change>.json`). The verify gate runs the same check — if it fails there, you lose a retry slot AND ~3 minutes of wall clock per cycle. Catch it locally in ~5 seconds instead.
+
+**The script also runs in the husky pre-commit hook**, so a non-zero exit blocks the commit before it ever reaches the verify gate. This is the fast local pre-empt: lint + i18n completeness run on every `git commit`, the same checks that run server-side.
 
 **If the script reports missing keys:**
 1. Open the referenced sidecar files (or create them with the `messages/<locale>.<change>.json` naming)

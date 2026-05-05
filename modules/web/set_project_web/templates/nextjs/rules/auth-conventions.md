@@ -249,3 +249,43 @@ export const { handlers, auth } = NextAuth({
 ```
 
 **The rule:** any `throw` that depends on `process.env.*` MUST live inside a function body that only runs at request/handler time. If the validation needs to fail fast on startup, put it in a dedicated `instrumentation.ts` (Next.js calls this once on server boot, never during build). Never at top level of a module imported by `src/app/**`.
+
+## Required admin-route server-side check
+
+Middleware that gates `/admin/**` is necessary but **not sufficient**. Next.js Router Cache can serve a previously-rendered page on client-side navigation without re-hitting middleware, so a user who briefly held an admin session can land on an admin route after their role has been revoked. Layouts and pages MUST repeat the role check on the server.
+
+**Every** file matching `src/app/[locale]/admin/**/page.tsx` and `src/app/[locale]/admin/**/layout.tsx` MUST begin with the canonical pattern:
+
+```typescript
+import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
+
+export default async function AdminLayout({
+  children,
+  params,
+}: {
+  children: React.ReactNode;
+  params: Promise<{ locale: string }>;
+}) {
+  const { locale } = await params;
+  const session = await auth();
+  if (!session?.user) {
+    redirect(`/${locale}/belepes?redirect=/${locale}/admin`);
+  }
+  if (session.user.role !== "ADMIN") {
+    redirect(`/${locale}/fiokom`);
+  }
+  return <>{children}</>;
+}
+```
+
+The same `await auth()` + role check MUST also appear at the top of every admin `page.tsx` server component, not only in the layout. The layout protects the wrapping shell; per-page checks protect the page when the layout is cached and reused across navigations.
+
+**Why both layout and page:**
+- Middleware: stops unauthenticated *initial* requests at the edge.
+- Layout `await auth()`: covers SSR re-runs and hydration boundaries.
+- Page `await auth()`: covers cases where Router Cache reuses the layout but Next renders a fresh page — without this check, a stale role can briefly leak admin content.
+
+**Locale prefix:** examples use `/hu` and `/en` here as generic placeholders. Read the project's `i18n/routing.ts` for the actual configured locales and use those literals. Never hardcode the locale; always read it from `params.locale`.
+
+**Smoke test:** every admin page MUST have at least one E2E case asserting that an unauthenticated visit redirects to `/belepes?redirect=...` and an authenticated CUSTOMER visit redirects to `/fiokom`. The verify gate's `e2e_coverage` requirement formalizes this.

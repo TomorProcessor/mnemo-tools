@@ -44,6 +44,9 @@ core:
   - messages/hu.json
   - messages/en.json
   - scripts/check-i18n-completeness.ts
+  - path: eslint.config.mjs
+    protected: true
+  - .husky/pre-commit
   - path: set/orchestration/config.yaml
     merge: true
   - framework-rules/web/api-design.md

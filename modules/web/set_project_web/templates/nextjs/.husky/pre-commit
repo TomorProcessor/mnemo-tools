@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# Web project type pre-commit hook.
+# Runs lint over staged files (via lint-staged) then the i18n completeness
+# check across the project. Either non-zero exit aborts the commit.
+#
+# Both checks also run server-side in the verify pipeline; the hook is the
+# fast local pre-empt so the agent does not burn an LLM review cycle on
+# issues a deterministic checker would catch.
+
+set -e
+
+pnpm lint-staged
+pnpm check:i18n

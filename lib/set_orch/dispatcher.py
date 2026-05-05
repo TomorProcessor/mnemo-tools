@@ -2021,6 +2021,22 @@ def _build_input_content(
                 scope,
             )
 
+    # Top-of-prompt MANDATORY checklist — surface prior CRITICAL/HIGH
+    # findings before scope so the agent reads them first. Empty review_learnings
+    # means "no prior findings to surface" and the section is suppressed.
+    # The checklist gets wrapped in AUTOREFRESH markers so a mid-iteration
+    # learnings update via _maybe_refresh_input_md() rewrites in place at the
+    # top, not at the bottom.
+    if ctx.review_learnings:
+        lines.append("# KOTELEZO ELLENORZES — review findings prior changes")
+        lines.append(ctx.review_learnings)
+        lines.append("")
+    if ctx.review_learnings_checklist:
+        lines.append(_LEARNINGS_SECTION_MARKER)
+        lines.append(ctx.review_learnings_checklist)
+        lines.append(_LEARNINGS_SECTION_END)
+        lines.append("")
+
     lines.append("## Scope")
     lines.append(scope)
     if roadmap_item and roadmap_item != scope:
@@ -2120,11 +2136,10 @@ def _build_input_content(
         for restriction in ctx.cross_cutting_restrictions:
             lines.append(f"- {restriction}")
 
-    if ctx.review_learnings:
-        lines.append(f"\n## Lessons from Prior Changes\n{ctx.review_learnings}")
-
-    if ctx.review_learnings_checklist:
-        lines.append(f"\n{ctx.review_learnings_checklist}")
+    # NOTE: review_learnings and review_learnings_checklist are rendered at
+    # the TOP of input.md (above ## Scope) so the agent reads them before
+    # drafting code. The previous bottom-of-file rendering proved insufficient —
+    # findings injected at line 180+ were ignored across runs.
 
     # Required Tests section (from generated test-plan.json)
     # Use pre-loaded entries from scope post-processing if available
@@ -2392,48 +2407,121 @@ def _build_review_learnings(
                 clustered_norms.add(norm)
                 break
 
-    # Build output lines
-    lines: list[str] = []
-
-    # Clustered patterns first (high signal)
-    _CLUSTER_LABELS = {
-        "no-auth": "No authentication",
-        "no-csrf": "Missing CSRF protection",
-        "xss": "XSS risk",
-        "no-rate-limit": "Missing rate limiting",
-        "secrets-exposed": "Secrets/credentials exposed",
-        "idor": "IDOR / missing ownership check",
-        "cascade-delete": "Cascade delete / data loss",
-        "race-condition": "Race condition / non-atomic operation",
-        "missing-validation": "Missing input validation",
-        "open-redirect": "Open redirect vulnerability",
+    # MUST/MUST NOT directives per cluster — surfaced top-of-prompt so the
+    # agent reads them before drafting code. Same finding categories as the
+    # learnings persistence layer; new entries here flow naturally into the
+    # rendered checklist.
+    _CLUSTER_DIRECTIVES = {
+        "no-auth": (
+            "Server-side auth check on every protected route",
+            "Begin every protected `page.tsx`/`layout.tsx` with `await auth()` and a role check.",
+            "Rely on middleware alone; Router Cache can serve cached pages without re-running middleware.",
+        ),
+        "no-csrf": (
+            "CSRF protection on state-changing routes",
+            "Use server actions or include CSRF tokens on POST/PUT/DELETE handlers.",
+            "Accept cross-origin POST requests without origin/CSRF-token verification.",
+        ),
+        "xss": (
+            "Escape every dynamic value in JSX",
+            "Render user-controlled values via React's default text interpolation.",
+            "Use `dangerouslySetInnerHTML` or template literal HTML for user data.",
+        ),
+        "no-rate-limit": (
+            "Rate-limit auth and write endpoints",
+            "Apply per-IP / per-user limits on login, registration, and write APIs.",
+            "Expose unbounded retry on credential or write endpoints.",
+        ),
+        "secrets-exposed": (
+            "Mask secrets and credentials in responses",
+            "Strip password hashes, tokens, and API keys before serializing.",
+            "Return raw user records, env values, or sensitive headers in API responses.",
+        ),
+        "idor": (
+            "Ownership check on every record access",
+            "Filter every read/write by `userId` or owner-equivalent in the WHERE clause.",
+            "Trust path/query parameters as authorization (e.g. `/api/orders/:id` with no owner check).",
+        ),
+        "cascade-delete": (
+            "Preserve transactional records on user delete",
+            "Soft-delete or unlink users from financial/audit records.",
+            "Cascade-delete from `User` to `Order`, `Payment`, or other immutable history.",
+        ),
+        "race-condition": (
+            "Atomic writes for inventory and balance changes",
+            "Wrap inventory decrement and balance updates in a single transaction with row locking.",
+            "Read-then-write inventory, balance, or counters without a transactional guard.",
+        ),
+        "missing-validation": (
+            "Zod (or equivalent) validation at every server boundary",
+            "Validate request bodies and query params before writing to the database.",
+            "Pass raw request payloads into Prisma or business logic.",
+        ),
+        "open-redirect": (
+            "Validate redirect targets against an allow-list",
+            "Resolve `redirect` query params against a whitelist or relative-path-only check.",
+            "Trust `?redirect=...` directly when issuing `redirect(...)`.",
+        ),
+        "i18n-hardcoded": (
+            "Use `useTranslations()`/`getTranslations()` for every user-visible string",
+            "Add the key to `messages/<locale>.json` for every locale, then call `t('namespace.key')`.",
+            "Inline literal Hungarian or English text in JSX inside `src/app/[locale]/**`.",
+        ),
+        "ui-image": (
+            "Use `Image` from `next/image` for every raster image",
+            "Import `Image` and pass `width`, `height`, and `alt`.",
+            "Use raw `<img src=...>` tags — `@next/next/no-img-element` will fail the lint gate.",
+        ),
     }
+    _CLUSTER_LABELS = {cid: directive[0] for cid, directive in _CLUSTER_DIRECTIVES.items()}
+
+    # Build category-grouped MUST/MUST NOT bullets. Each cluster that fired
+    # contributes one MUST and one MUST NOT line plus the originating change
+    # names so the agent can cross-reference findings if it wants context.
+    bullets: list[str] = []
     for cid, changes_set in sorted(cluster_results.items(), key=lambda x: -len(x[1])):
-        label = _CLUSTER_LABELS.get(cid, cid)
+        directive = _CLUSTER_DIRECTIVES.get(cid)
+        if directive is None:
+            label = _CLUSTER_LABELS.get(cid, cid)
+            names = ", ".join(sorted(changes_set)[:3])
+            suffix = f" +{len(changes_set)-3} more" if len(changes_set) > 3 else ""
+            bullets.append(f"- **{label}** ({names}{suffix})")
+            continue
+        label, must, must_not = directive
         names = ", ".join(sorted(changes_set)[:3])
         suffix = f" +{len(changes_set)-3} more" if len(changes_set) > 3 else ""
-        lines.append(f"- **{label}** ({names}{suffix})")
+        bullets.append(f"- **{label}** (flagged in: {names}{suffix})")
+        bullets.append(f"  - MUST: {must}")
+        bullets.append(f"  - MUST NOT: {must_not}")
 
-    # Unclustered individual patterns (deduplicated, top 5)
+    # Unclustered individual patterns (top 5) — keep one-line per pattern.
     unclustered = {k: v for k, v in pattern_counts.items() if k not in clustered_norms}
-    for norm, changes_set in sorted(unclustered.items(), key=lambda x: -len(x[1]))[:5]:
-        names = ", ".join(sorted(changes_set)[:2])
-        lines.append(f"- {norm.strip('*').strip()} ({names})")
+    if unclustered:
+        bullets.append("- **Other prior findings** — re-read each before submitting:")
+        for norm, changes_set in sorted(unclustered.items(), key=lambda x: -len(x[1]))[:5]:
+            names = ", ".join(sorted(changes_set)[:2])
+            bullets.append(f"  - {norm.strip('*').strip()} ({names})")
 
-    if not lines:
+    if not bullets:
         return ""
 
-    # Cap at 12 finding lines
-    lines = lines[:12]
+    # Cap total rendered lines so the section stays scannable.
+    bullets = bullets[:30]
 
     from .paths import LineagePaths as _LP_rf
     _findings_rel = os.path.relpath(
         _LP_rf(os.getcwd()).review_findings, os.getcwd()
     )
+    logger.debug(
+        "_build_review_learnings: rendered %d clustered + %d unclustered findings (total %d bullets)",
+        len(cluster_results), min(len(unclustered), 5), len(bullets),
+    )
     return (
-        "These patterns caused CRITICAL/HIGH failures in other changes during this run:\n"
-        + "\n".join(lines)
+        "These patterns caused CRITICAL/HIGH failures in other changes during this run.\n"
+        "Internalize the MUST / MUST NOT directives below before drafting code.\n\n"
+        + "\n".join(bullets)
         + f"\n\nFull details: `{_findings_rel}`"
+        + "\n\n--- end of mandatory checklist; scope/requirements follow below ---"
     )
 
 
