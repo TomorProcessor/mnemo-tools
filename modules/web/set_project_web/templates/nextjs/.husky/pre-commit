@@ -1,13 +1,18 @@
 #!/usr/bin/env sh
 # Web project type pre-commit hook.
-# Runs lint over staged files (via lint-staged) then the i18n completeness
-# check across the project. Either non-zero exit aborts the commit.
+# Runs lint over staged files via lint-staged. ESLint catches:
+#   - raw <img> tags (@next/next/no-img-element)
+#   - hardcoded JSX strings inside src/app/[locale]/** (i18next/no-literal-string)
+# Only staged files are checked, so a previously-merged file with violations
+# does not block unrelated future commits.
 #
-# Both checks also run server-side in the verify pipeline; the hook is the
-# fast local pre-empt so the agent does not burn an LLM review cycle on
-# issues a deterministic checker would catch.
+# i18n key-completeness (`pnpm check:i18n`) is intentionally NOT run here:
+# it scans the whole project and would block commits whenever any pre-existing
+# missing translation key remains anywhere in src/. Use `pnpm check:i18n`
+# manually as a self-check before submitting; the verify pipeline still
+# enforces it server-side as a gate.
 
 set -e
 
 pnpm lint-staged
-pnpm check:i18n
+

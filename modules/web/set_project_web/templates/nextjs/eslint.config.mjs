@@ -1,17 +1,23 @@
 // Flat ESLint config deployed by the web project type.
 //
-// Two rule blocks:
-//   1. Project-wide: forbid raw <img> via @next/next/no-img-element.
-//   2. Locale-routed pages only: forbid hardcoded user-visible JSX strings
-//      via i18next/no-literal-string.
-//
-// The locale-scope keeps the no-literal-string rule from firing on API
-// routes, server actions outside [locale], or test fixtures. The attribute
-// ignore list keeps it quiet for non-UI props that legitimately carry
-// string literals (className, ids, ARIA labels, test ids).
+// Uses FlatCompat to bring in `next/core-web-vitals` (which carries the
+// TypeScript parser, plugins, and Next.js rule set) into the flat-config
+// world. Then layers two scoped overrides:
+//   1. Project-wide: bump @next/next/no-img-element to error.
+//   2. Locale-routed pages only: i18next/no-literal-string to catch
+//      hardcoded JSX strings that should go through useTranslations().
 
-import nextPlugin from "@next/eslint-plugin-next";
+import { FlatCompat } from "@eslint/eslintrc";
 import i18nextPlugin from "eslint-plugin-i18next";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const compat = new FlatCompat({
+  baseDirectory: __dirname,
+});
 
 const IGNORED_ATTRIBUTES = [
   "className",
@@ -25,19 +31,18 @@ const IGNORED_ATTRIBUTES = [
 ];
 
 export default [
-  // 1) Project-wide Next.js rules — applies to every TS/TSX under src/.
+  // 1) Bring in Next.js's full TypeScript-aware config (parser + rules).
+  ...compat.extends("next/core-web-vitals"),
+
+  // 2) Project-wide override — raw <img> is a hard error, not a warning.
   {
     files: ["src/**/*.{ts,tsx}"],
-    plugins: {
-      "@next/next": nextPlugin,
-    },
     rules: {
-      ...nextPlugin.configs["core-web-vitals"].rules,
       "@next/next/no-img-element": "error",
     },
   },
 
-  // 2) Locale-routed pages only — forbid hardcoded user-visible JSX strings.
+  // 3) Locale-routed pages only — forbid hardcoded user-visible JSX strings.
   {
     files: ["src/app/[locale]/**/*.{ts,tsx}"],
     plugins: {
@@ -56,14 +61,28 @@ export default [
             exclude: ["[0-9!-/:-@[-`{-~]+", "[A-Z_-]+"],
           },
           callees: {
-            exclude: ["i18n(ext)?", "t", "require", "addEventListener", "removeEventListener", "postMessage", "getElementById", "dispatch", "commit", "includes", "indexOf", "endsWith", "startsWith"],
+            exclude: [
+              "i18n(ext)?",
+              "t",
+              "require",
+              "addEventListener",
+              "removeEventListener",
+              "postMessage",
+              "getElementById",
+              "dispatch",
+              "commit",
+              "includes",
+              "indexOf",
+              "endsWith",
+              "startsWith",
+            ],
           },
         },
       ],
     },
   },
 
-  // 3) Ignore generated and vendored output.
+  // 4) Ignore generated and vendored output.
   {
     ignores: [".next/**", "node_modules/**", "out/**", "build/**", "coverage/**"],
   },
