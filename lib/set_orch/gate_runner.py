@@ -770,6 +770,12 @@ class GatePipeline:
 
         return "continue"
 
+    # Hardcoded mappings for legacy/canonical gate field names. Profile-
+    # registered gates that don't appear here fall through to the
+    # auto-derived `<name>_result`/`gate_<name>_ms`/`<name>_output`
+    # convention via `_resolve_gate_fields()`. New gates do NOT need an
+    # entry here — they only need to be added if the writer should
+    # produce a non-conventional field name.
     _GATE_STATE_FIELDS = {
         "build": "build_result", "test": "test_result",
         "e2e": "e2e_result", "smoke": "smoke_result",
@@ -788,6 +794,32 @@ class GatePipeline:
         "scope_check": "scope_check_output", "rules": "rules_output",
         "e2e_coverage": "e2e_coverage_output",
     }
+
+    @classmethod
+    def _resolve_gate_fields(
+        cls, entry: "_GateEntry",
+    ) -> tuple[str, str, str]:
+        """Return (state_field, ms_field, output_field) for a gate.
+
+        Resolution order: explicit `entry.result_fields` from the
+        GateDefinition wins; otherwise hardcoded canonical mappings;
+        otherwise auto-derive from the gate name (hyphens → underscores)
+        as `<name>_result` / `gate_<name>_ms` / `<name>_output`.
+
+        Auto-derivation is what unblocks profile-registered gates like
+        `design-fidelity` and `i18n_check` which previously fell through
+        the dict.get() and were never journaled — invisible to the
+        dashboard ("retry · unknown") and to forensics.
+        """
+        norm = entry.name.replace("-", "_")
+        if entry.result_fields:
+            state_field = entry.result_fields[0]
+            ms_field = entry.result_fields[1] if len(entry.result_fields) > 1 else f"gate_{norm}_ms"
+        else:
+            state_field = cls._GATE_STATE_FIELDS.get(entry.name) or f"{norm}_result"
+            ms_field = cls._GATE_MS_FIELDS.get(entry.name) or f"gate_{norm}_ms"
+        output_field = cls._GATE_OUTPUT_FIELDS.get(entry.name) or f"{norm}_output"
+        return state_field, ms_field, output_field
 
     def _persist_gate_result(
         self, entry: _GateEntry, result: GateResult, elapsed_ms: int,
@@ -812,22 +844,19 @@ class GatePipeline:
                     entry.name, self.change_name, exc,
                 )
 
-        state_field = self._GATE_STATE_FIELDS.get(entry.name)
-        ms_field = self._GATE_MS_FIELDS.get(entry.name)
-        output_field = self._GATE_OUTPUT_FIELDS.get(entry.name)
-        if state_field and self.state_file:
+        state_field, ms_field, output_field = self._resolve_gate_fields(entry)
+        if self.state_file:
             update_change_field(
                 self.state_file, self.change_name, state_field, result.status,
             )
-        if ms_field and self.state_file:
             update_change_field(
                 self.state_file, self.change_name, ms_field, elapsed_ms,
             )
-        if output_field and self.state_file and result.output:
-            update_change_field(
-                self.state_file, self.change_name, output_field,
-                _truncate_gate_output(entry.name, result.output),
-            )
+            if result.output:
+                update_change_field(
+                    self.state_file, self.change_name, output_field,
+                    _truncate_gate_output(entry.name, result.output),
+                )
 
     def _finalize_result(
         self, entry: _GateEntry, result: GateResult, elapsed_ms: int,

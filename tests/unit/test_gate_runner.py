@@ -432,3 +432,70 @@ class TestGatePipelineParallelGroup:
         pipeline.run()
         assert order == ["spec_verify", "review"]
         assert pipeline.parallel_group_runs == []
+
+
+class TestPersistGateResultAutoDerive:
+    """Profile-registered gates without canonical mappings must still be journaled.
+
+    Regression: design-fidelity and i18n_check (modules/web profile) were
+    silently dropped from the journal because `_persist_gate_result` looked
+    them up in the hardcoded `_GATE_STATE_FIELDS` dict and got None. Result:
+    dashboard rendered every retry as "retry · unknown" and forensic
+    queries had no way to attribute failures to a specific gate.
+    """
+
+    def test_unknown_gate_auto_derives_field_names(self, tmp_path):
+        state_file = _make_state(tmp_path)
+        gc = FakeGateConfig()
+        change = Change(name="c1", status="running")
+
+        pipeline = GatePipeline(gc, state_file, "c1", change, max_retries=2)
+        pipeline.register(
+            "i18n_check",
+            lambda: GateResult("i18n_check", "fail", output="missing key: hu.foo"),
+        )
+        pipeline.run()
+
+        state = load_state(state_file)
+        c1 = [c for c in state.changes if c.name == "c1"][0]
+        assert c1.extras.get("i18n_check_result") == "fail"
+        assert c1.extras.get("gate_i18n_check_ms") is not None
+        assert "missing key" in c1.extras.get("i18n_check_output", "")
+
+    def test_hyphenated_gate_normalizes_to_underscore(self, tmp_path):
+        state_file = _make_state(tmp_path)
+        gc = FakeGateConfig()
+        change = Change(name="c1", status="running")
+
+        pipeline = GatePipeline(gc, state_file, "c1", change, max_retries=2)
+        pipeline.register(
+            "design-fidelity",
+            lambda: GateResult("design-fidelity", "fail", output="skeleton mismatch"),
+        )
+        pipeline.run()
+
+        state = load_state(state_file)
+        c1 = [c for c in state.changes if c.name == "c1"][0]
+        # design-fidelity → design_fidelity_* (hyphen normalised to
+        # underscore so the field name is a valid Python identifier
+        # and matches the dashboard's `<name>_result` regex).
+        assert c1.extras.get("design_fidelity_result") == "fail"
+        assert c1.extras.get("gate_design_fidelity_ms") is not None
+        assert c1.extras.get("design_fidelity_output") == "skeleton mismatch"
+
+    def test_canonical_gate_still_uses_dataclass_field(self, tmp_path):
+        # Regression guard: the auto-derive path must NOT take over for
+        # gates that have explicit dataclass fields (build_result,
+        # test_result, etc.) — those still need to land on the typed
+        # field, not in extras.
+        state_file = _make_state(tmp_path)
+        gc = FakeGateConfig()
+        change = Change(name="c1", status="running")
+
+        pipeline = GatePipeline(gc, state_file, "c1", change, max_retries=2)
+        pipeline.register("build", lambda: GateResult("build", "pass"))
+        pipeline.run()
+
+        state = load_state(state_file)
+        c1 = [c for c in state.changes if c.name == "c1"][0]
+        assert c1.build_result == "pass"

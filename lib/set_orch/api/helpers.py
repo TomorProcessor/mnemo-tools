@@ -110,31 +110,31 @@ def _resolve_project(project_name: str) -> Path:
 
 
 def _state_path(project_path: Path) -> Path:
-    """Find orchestration state file — LineagePaths canonical, then
-    project-local legacy fallbacks for backward compat during Section
-    15b migration.  Every literal path is derived from a resolver
-    property so the audit gate sees no hardcoded string here.
+    """Find orchestration state file.
+
+    Among candidate locations (canonical LineagePaths + legacy project-local
+    paths), pick the one with the newest mtime. Picking by precedence alone
+    breaks for runs where the orchestrator was launched with an explicit
+    legacy --state path while a stale canonical stub also exists from
+    lineage migration: the legacy file is live, the canonical is frozen.
+    The reader must follow the actual writer.
     """
     from ..paths import LineagePaths
     lp = LineagePaths(str(project_path))
     canonical = Path(lp.state_file)
-    if canonical.exists():
-        return canonical
-    # Legacy project-local write locations produced by older writers.
-    # We construct the filenames from the resolver basename so adding a
-    # new canonical name does not require touching this file.
-    # Legacy writers prefixed the canonical basename with `orchestration-`;
-    # we reconstruct that name from the resolver's basename at runtime.
     legacy_basename = "orchestration-" + canonical.name
     orch_rel = os.path.relpath(
         os.path.dirname(lp.coverage_report), str(project_path)
     )
-    new = project_path / orch_rel / legacy_basename
-    if new.exists():
-        return new
-    legacy = project_path / legacy_basename
-    if legacy.exists():
-        return legacy
+    candidates = [
+        canonical,
+        project_path / orch_rel / legacy_basename,
+        project_path / legacy_basename,
+    ]
+    existing = [(p, p.stat().st_mtime) for p in candidates if p.exists()]
+    if existing:
+        existing.sort(key=lambda x: x[1], reverse=True)
+        return existing[0][0]
     return canonical
 
 

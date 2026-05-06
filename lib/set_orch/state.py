@@ -25,37 +25,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_JOURNALED_FIELDS: frozenset[str] = frozenset(
-    {
-        "build_result",
-        "test_result",
-        "e2e_result",
-        "smoke_result",
-        "review_result",
-        "scope_check_result",
-        "rules_result",
-        "e2e_coverage_result",
-        "build_output",
-        "test_output",
-        "e2e_output",
-        "smoke_output",
-        "review_output",
-        "scope_check_output",
-        "rules_output",
-        "e2e_coverage_output",
-        "gate_build_ms",
-        "gate_test_ms",
-        "gate_e2e_ms",
-        "gate_review_ms",
-        "gate_smoke_ms",
-        "gate_scope_check_ms",
-        "gate_rules_ms",
-        "gate_e2e_coverage_ms",
-        "retry_context",
-        "status",
-        "current_step",
-    }
+_JOURNALED_NON_GATE_FIELDS: frozenset[str] = frozenset(
+    {"retry_context", "status", "current_step"}
 )
+
+# Gate-related fields are journaled by pattern instead of an explicit
+# whitelist so profile-registered gates (design-fidelity, i18n_check,
+# required-components, future profile additions) are journaled
+# automatically without coordinating string updates here every time.
+# Without this the writer's `update_change_field("design_fidelity_result",...)`
+# call lands in `change.extras` only — the journal jsonl stays empty
+# and the dashboard renders the retry as "unknown".
+import re as _re
+
+_JOURNALED_FIELD_PATTERN = _re.compile(
+    r"^(?:[A-Za-z0-9_-]+_result|[A-Za-z0-9_-]+_output|gate_[A-Za-z0-9_-]+_ms)$"
+)
+
+
+def _is_journaled_field(field_name: str) -> bool:
+    if field_name in _JOURNALED_NON_GATE_FIELDS:
+        return True
+    return bool(_JOURNALED_FIELD_PATTERN.match(field_name))
 
 _JOURNAL_SEQ_CACHE: dict[str, int] = {}
 
@@ -849,7 +840,7 @@ def update_change_field(
         if value != old_value:
             logger.info("State update: %s.%s = %r (was: %r)", change_name, field_name, value, old_value)
 
-            if field_name in _JOURNALED_FIELDS:
+            if _is_journaled_field(field_name):
                 try:
                     _append_journal(path, change_name, field_name, old_value, value)
                 except BaseException as exc:

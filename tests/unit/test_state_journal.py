@@ -19,7 +19,7 @@ from set_orch.state import (
     Change,
     OrchestratorState,
     _JOURNAL_SEQ_CACHE,
-    _JOURNALED_FIELDS,
+    _is_journaled_field,
     _journal_path,
     save_state,
     update_change_field,
@@ -53,17 +53,37 @@ def _read_journal(state_file: str, change_name: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-class TestJournaledFieldsFrozenset:
+class TestJournaledFieldsPredicate:
     def test_contains_core_gate_fields(self):
         for f in ("build_result", "test_result", "e2e_result", "review_result"):
-            assert f in _JOURNALED_FIELDS
+            assert _is_journaled_field(f)
 
     def test_contains_status_and_current_step(self):
-        assert "status" in _JOURNALED_FIELDS
-        assert "current_step" in _JOURNALED_FIELDS
+        assert _is_journaled_field("status")
+        assert _is_journaled_field("current_step")
 
     def test_contains_retry_context(self):
-        assert "retry_context" in _JOURNALED_FIELDS
+        assert _is_journaled_field("retry_context")
+
+    def test_pattern_matches_profile_gates(self):
+        # Profile-registered gates land here automatically — no
+        # explicit whitelist update needed when modules add gates.
+        for f in (
+            "design_fidelity_result", "design_fidelity_output",
+            "i18n_check_result", "i18n_check_output", "gate_i18n_check_ms",
+            "lint_result", "gate_lint_ms",
+            "required_components_result",
+        ):
+            assert _is_journaled_field(f), f"expected {f} to journal"
+
+    def test_pattern_excludes_arbitrary_extras_fields(self):
+        # Counter / state fields written via update_change_field that
+        # aren't gate-related must NOT spam the journal.
+        for f in (
+            "tokens_used", "verify_retry_count", "gate_retry_count",
+            "worktree_path", "branch", "test_stats",
+        ):
+            assert not _is_journaled_field(f), f"did not expect {f} to journal"
 
 
 class TestJournalAppend:

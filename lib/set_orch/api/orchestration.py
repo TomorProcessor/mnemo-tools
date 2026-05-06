@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -212,6 +213,42 @@ def _load_journal_entries(journal_path: Path) -> list[dict]:
 
 _GATES = ("build", "test", "e2e", "review", "smoke", "scope_check", "rules", "e2e_coverage")
 
+# Result-field names that look like `<gate>_result` but are NOT gates and
+# should be excluded from journal grouping. spec_coverage_result is the
+# spec_verify gate's result alias and is surfaced through a different UI.
+_NON_GATE_RESULT_FIELDS = frozenset({"spec_coverage"})
+
+_RESULT_FIELD_RE = re.compile(r"^(.+)_result$")
+
+
+def _discover_gates_from_journal(entries: list[dict]) -> tuple[str, ...]:
+    """Derive the set of gate names present in a journal.
+
+    Any field matching `<name>_result` (excluding `_NON_GATE_RESULT_FIELDS`)
+    is treated as a gate. This unblocks profile-registered gates like
+    `design_fidelity` and `i18n_check` that aren't in the canonical
+    `_GATES` tuple — without the dashboard renders them as
+    "retry · unknown" because the grouper skipped their entries.
+
+    Canonical gate order is preserved first; profile gates append in
+    discovery order so the dashboard layout stays stable for the
+    common case.
+    """
+    seen = set()
+    found: list[str] = []
+    for e in entries:
+        m = _RESULT_FIELD_RE.match(e.get("field", ""))
+        if not m:
+            continue
+        name = m.group(1)
+        if name in _NON_GATE_RESULT_FIELDS or name in seen:
+            continue
+        seen.add(name)
+        found.append(name)
+    canonical = [g for g in _GATES if g in seen]
+    extras = [g for g in found if g not in _GATES]
+    return tuple(canonical + extras)
+
 
 def _parse_journal_ts(ts) -> float:
     """Parse a journal entry timestamp to epoch seconds, 0.0 on any failure.
@@ -240,14 +277,19 @@ def _group_journal_by_gate(entries: list[dict]) -> dict[str, list[dict]]:
     Strategy: iterate chronologically and for each `<gate>_result` entry,
     attach the most-recent `<gate>_output` and `gate_<gate>_ms` that share
     a timestamp within a ±2s window. Each result closes one run.
+
+    Gate names are discovered from the journal itself rather than a
+    hardcoded list, so any profile-registered gate (e.g. `design_fidelity`,
+    `i18n_check`) shows up in the dashboard once the writer journals it.
     """
-    grouped: dict[str, list[dict]] = {g: [] for g in _GATES}
-    run_counters: dict[str, int] = {g: 0 for g in _GATES}
+    gates = _discover_gates_from_journal(entries)
+    grouped: dict[str, list[dict]] = {g: [] for g in gates}
+    run_counters: dict[str, int] = {g: 0 for g in gates}
 
     by_gate_field: dict[tuple[str, str], list[dict]] = {}
     for e in entries:
         field = e.get("field", "")
-        for g in _GATES:
+        for g in gates:
             if field == f"{g}_result":
                 by_gate_field.setdefault((g, "result"), []).append(e)
             elif field == f"{g}_output":
@@ -266,7 +308,7 @@ def _group_journal_by_gate(entries: list[dict]) -> dict[str, list[dict]]:
                 best_delta = delta
         return best
 
-    for gate in _GATES:
+    for gate in gates:
         results = by_gate_field.get((gate, "result"), [])
         outputs = by_gate_field.get((gate, "output"), [])
         timings = by_gate_field.get((gate, "ms"), [])
