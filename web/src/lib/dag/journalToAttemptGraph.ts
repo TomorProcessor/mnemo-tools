@@ -16,11 +16,16 @@ const GATE_KINDS: ReadonlyArray<Exclude<GateKind, 'impl' | 'terminal'>> = [
   'e2e_coverage',
   'review',
   'smoke',
+  'smoke_e2e',
   'scope_check',
   'rules',
   'lint',
   'spec_verify',
+  'spec_coverage',
   'i18n_check',
+  'design_fidelity',
+  'required_components',
+  'coverage_check',
   'merge',
 ]
 
