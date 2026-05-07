@@ -538,7 +538,7 @@ def execute_design_fidelity_gate(
     retry_ctx = _build_retry_context(outcome)
     return GateResult(
         "design-fidelity", "fail",
-        output=outcome.message or "fidelity check failed",
+        output=_build_output_summary(outcome),
         retry_context=retry_ctx,
         stats={
             "failed_routes": [f.route for f in outcome.failed_routes],
@@ -1850,3 +1850,48 @@ def _build_retry_context(outcome: GateOutcome) -> str:
         "Do NOT change design tokens or globals.css. See .claude/rules/design-bridge.md."
     )
     return "\n".join(lines)
+
+
+def _build_output_summary(outcome: GateOutcome, max_details: int = 8) -> str:
+    """Build a dashboard-friendly summary of the violations.
+
+    The journal's *_output field is what the UI surfaces under each gate
+    node — surfacing just outcome.message ("design-drift") leaves
+    operators without actionable info. Include a category breakdown plus
+    the first few violation details so the gate row in the dashboard
+    actually explains what failed.
+    """
+    from collections import Counter
+
+    parts: list[str] = []
+    header = outcome.message or "fidelity check failed"
+    parts.append(header)
+
+    if outcome.skeleton_violations:
+        by_status = Counter(v.status for v in outcome.skeleton_violations)
+        breakdown = ", ".join(
+            f"{n} {status}" for status, n in by_status.most_common()
+        )
+        parts.append(
+            f"\nViolations ({len(outcome.skeleton_violations)}): {breakdown}"
+        )
+        for v in outcome.skeleton_violations[:max_details]:
+            parts.append(f"  - [{v.status}] {v.detail}")
+        if len(outcome.skeleton_violations) > max_details:
+            parts.append(
+                f"  ... ({len(outcome.skeleton_violations) - max_details} more)"
+            )
+
+    if outcome.failed_routes:
+        parts.append(f"\nFailed routes ({len(outcome.failed_routes)}):")
+        for f in outcome.failed_routes[:max_details]:
+            parts.append(
+                f"  - {f.route} @ {f.viewport}: diff={f.diff_pct:.2f}% "
+                f"({f.diff_px}px)"
+            )
+        if len(outcome.failed_routes) > max_details:
+            parts.append(
+                f"  ... ({len(outcome.failed_routes) - max_details} more)"
+            )
+
+    return "\n".join(parts)

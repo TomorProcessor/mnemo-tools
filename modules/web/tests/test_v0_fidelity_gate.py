@@ -700,6 +700,66 @@ def test_shadcn_primitive_parity_present_in_src_passes(tmp_path: Path):
         f"CommandDialog is imported in src/, should pass; got: {[(v.status, v.detail) for v in violations]}"
 
 
+def test_build_output_summary_includes_violation_breakdown():
+    """The dashboard output for a failed gate must include category breakdown
+    and per-violation details, not just `outcome.message`. Without this the
+    dashboard's gate row shows only "design-drift" and operators can't tell
+    which routes/files are at fault without diving into stats.
+    """
+    from set_project_web.v0_fidelity_gate import (
+        GateOutcome,
+        SkeletonViolation,
+        _build_output_summary,
+    )
+
+    outcome = GateOutcome(
+        status="fail",
+        message="design-drift",
+        skeleton_violations=[
+            SkeletonViolation("hardcoded-color", "src/app/page.tsx:42 #ff0000"),
+            SkeletonViolation("hardcoded-color", "src/components/foo.tsx:15 rgb(0,0,0)"),
+            SkeletonViolation("missing-route", "/products/featured not implemented"),
+        ],
+    )
+    summary = _build_output_summary(outcome)
+    assert "design-drift" in summary
+    # Category breakdown
+    assert "Violations (3)" in summary
+    assert "2 hardcoded-color" in summary
+    assert "1 missing-route" in summary
+    # Per-violation details
+    assert "src/app/page.tsx:42" in summary
+    assert "/products/featured" in summary
+
+
+def test_build_output_summary_truncates_long_lists():
+    """Cap the per-violation lines so the journal output stays under the
+    2000-byte gate output budget — the count is preserved in the breakdown."""
+    from set_project_web.v0_fidelity_gate import (
+        GateOutcome,
+        SkeletonViolation,
+        _build_output_summary,
+    )
+
+    violations = [
+        SkeletonViolation("hardcoded-color", f"src/file{i}.tsx:10 #ff{i:04x}")
+        for i in range(20)
+    ]
+    outcome = GateOutcome(
+        status="fail",
+        message="design-drift",
+        skeleton_violations=violations,
+    )
+    summary = _build_output_summary(outcome, max_details=8)
+    assert "Violations (20)" in summary
+    # First 8 detail lines
+    assert "src/file0.tsx" in summary
+    assert "src/file7.tsx" in summary
+    # 9th onward suppressed
+    assert "src/file8.tsx" not in summary
+    assert "(12 more)" in summary
+
+
 def test_is_shadow_alias_pattern_detection():
     """Direct unit test of _is_shadow_alias pattern recognition."""
     from set_project_web.v0_fidelity_gate import _is_shadow_alias
