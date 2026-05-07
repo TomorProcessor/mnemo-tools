@@ -116,6 +116,7 @@ export function journalToAttemptGraph(
 
   const attempts: Attempt[] = []
   const runIndexByKind = new Map<GateKind, number>()
+  const lastKnownResultByKind = new Map<GateKind, GateResult>()
   let terminal: AttemptGraph['terminal'] = 'in-progress'
 
   function openNewAttempt(startTs: string): Attempt {
@@ -191,6 +192,7 @@ export function journalToAttemptGraph(
     const resultKind = resultFieldToKind(e.field)
     if (resultKind) {
       const result = normalizeResult(e.new)
+      lastKnownResultByKind.set(resultKind, result)
       if (result === 'skip') continue
       let attempt = current()
       if (!attempt) attempt = openNewAttempt(e.ts)
@@ -212,6 +214,37 @@ export function journalToAttemptGraph(
       }
       attempt.nodes.push(node)
       continue
+    }
+
+    // Synthesize gate node from gate_<kind>_ms when the gate ran but its
+    // result was unchanged from a prior attempt — journal records only
+    // deltas, so a same-valued result (e.g. fail → fail) leaves no
+    // *_result entry. Without this, the attempt has no gate-fail node and
+    // gets classified retry-unknown.
+    const msKind = msFieldToKind(e.field)
+    if (msKind) {
+      const attempt = current()
+      if (!attempt) continue
+      if (attempt.nodes.some((n) => n.kind === msKind)) continue
+      const carryResult = lastKnownResultByKind.get(msKind) ?? null
+      if (carryResult === null || carryResult === 'skip') continue
+      const runIdx = (runIndexByKind.get(msKind) ?? 0) + 1
+      runIndexByKind.set(msKind, runIdx)
+      const targetTs = parseTs(e.ts)
+      const msValue = typeof e.new === 'number' ? e.new : Number(e.new) || 0
+      const outputMatch = pickClosest(outputsByKind.get(msKind) ?? [], targetTs)
+      const node: AttemptNode = {
+        id: `a${attempt.n}-${msKind}-${runIdx}`,
+        attempt: attempt.n,
+        kind: msKind,
+        runIndexForKind: runIdx,
+        result: carryResult,
+        ms: msValue,
+        startedAt: e.ts,
+        endedAt: e.ts,
+        output: outputMatch ? outputMatch.value : undefined,
+      }
+      attempt.nodes.push(node)
     }
   }
 

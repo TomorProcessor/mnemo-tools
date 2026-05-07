@@ -341,6 +341,47 @@ describe('journalToAttemptGraph', () => {
     expect(g.terminal).toBe('in-progress')
   })
 
+  it('synthesizes gate node from gate_*_ms when result is unchanged across attempts', () => {
+    // Regression: craftbrew-run-20260502-1603 checkout-flow attempt #3 ran
+    // e2e again and it failed again with the same `fail` result. The
+    // journal records only deltas, so e2e_result emitted no entry — only
+    // gate_e2e_ms (different duration) and e2e_output (different failure
+    // list). Without ms-synthesis, attempt #3 had no gate-fail node and
+    // was classified retry-unknown.
+    const entries: JournalEntry[] = [
+      // Attempt 1: e2e fails
+      entry('2026-05-06T10:00:00.000Z', 'status', 'running', 1, 'dispatched'),
+      entry('2026-05-06T10:00:30.000Z', 'status', 'integrating', 2, 'running'),
+      entry('2026-05-06T10:01:00.000Z', 'build_result', 'pass', 3),
+      entry('2026-05-06T10:01:00.001Z', 'gate_build_ms', 17200, 4),
+      entry('2026-05-06T10:02:00.000Z', 'e2e_result', 'fail', 5),
+      entry('2026-05-06T10:02:00.001Z', 'gate_e2e_ms', 345143, 6),
+      entry('2026-05-06T10:02:30.000Z', 'status', 'verify-failed', 7, 'integrating'),
+      // Attempt 2: gates run again, e2e fails AGAIN (same value, no result delta)
+      entry('2026-05-06T10:03:00.000Z', 'status', 'running', 8, 'verify-failed'),
+      entry('2026-05-06T10:25:00.000Z', 'status', 'integrating', 9, 'running'),
+      entry('2026-05-06T10:25:30.000Z', 'gate_build_ms', 18216, 10, 17200),
+      entry('2026-05-06T10:27:00.000Z', 'gate_e2e_ms', 122357, 11, 345143),
+      entry('2026-05-06T10:27:00.100Z', 'e2e_output', 'E2E: 1 NEW failure', 12, 'E2E: 17 NEW failures'),
+      entry('2026-05-06T10:27:30.000Z', 'status', 'verify-failed', 13, 'integrating'),
+      entry('2026-05-06T10:28:00.000Z', 'status', 'running', 14, 'verify-failed'),
+    ]
+    const g = journalToAttemptGraph(entries)
+    expect(g.attempts).toHaveLength(3)
+    // Attempt 1: real e2e fail node
+    expect(g.attempts[0].retryReason).toBe('gate-fail')
+    // Attempt 2: synthesized build-pass + e2e-fail nodes from ms updates,
+    // classification must be gate-fail (not unknown)
+    const a2Kinds = g.attempts[1].nodes.map((n) => n.kind)
+    expect(a2Kinds).toContain('build')
+    expect(a2Kinds).toContain('e2e')
+    const a2E2e = g.attempts[1].nodes.find((n) => n.kind === 'e2e')!
+    expect(a2E2e.result).toBe('fail')
+    expect(a2E2e.ms).toBe(122357)
+    expect(a2E2e.output).toBe('E2E: 1 NEW failure')
+    expect(g.attempts[1].retryReason).toBe('gate-fail')
+  })
+
   it('renders all post-MVP gate kinds (lint, test_files, e2e_coverage, spec_verify, i18n_check)', () => {
     // Regression: craftbrew-run-20260415-0146 admin-products attempt #4 ran
     // build → test → e2e → lint → scope_check → test_files → e2e_coverage →
