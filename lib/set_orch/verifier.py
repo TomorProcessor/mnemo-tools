@@ -4219,10 +4219,19 @@ def handle_change_done(
         result_fields=("test_result", "gate_test_ms"),
     )
     # Register profile gates (e2e, lint from web module if available)
+    _project_path = os.path.dirname(state_file) or os.getcwd()
     if profile is not None and hasattr(profile, "register_gates"):
         try:
             for gd in profile.register_gates():
                 if gd.phase != "pre-merge":
+                    continue
+                if gd.name == "design-fidelity" and not profile.has_design_pipeline(
+                    Path(_project_path), directives,
+                ):
+                    logger.info(
+                        "Verify gate: design-fidelity skipped for %s (no design pipeline)",
+                        change_name,
+                    )
                     continue
                 if gd.name == "e2e":
                     # Scope E2E to own spec files only (FIX 5) — same as

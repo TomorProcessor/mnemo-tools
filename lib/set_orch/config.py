@@ -141,6 +141,7 @@ DIRECTIVE_DEFAULTS: dict[str, Any] = {
     "milestones_max_worktrees": 3,
     "e2e_port_base": None,
     "gate_overrides": {},
+    "design_pipeline": "auto",
     "discord": None,
     "completion_timeout": 300,
     # fix-replan-stuck-gate-and-decomposer: per-change stuck-loop circuit breaker.

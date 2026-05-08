@@ -3069,6 +3069,7 @@ def dispatch_change(
     # ANY exception from the profile methods fails the dispatch loudly with
     # reason `design-provider-error`.
     project_path = os.path.dirname(state_path) or os.getcwd()
+    _design_profile = None
     try:
         from .profile_loader import load_profile as _load_profile_for_design
         _design_profile = _load_profile_for_design()
@@ -3077,7 +3078,11 @@ def dispatch_change(
         logger.error("detect_design_source raised for %s", change_name, exc_info=True)
         _design_source_id = "none"
 
-    if _design_source_id != "none":
+    _has_design = (
+        _design_profile is not None
+        and _design_profile.has_design_pipeline(Path(project_path), _directives)
+    )
+    if _has_design:
         try:
             _deploy_v0_export_to_worktree(project_path, wt_path)
             _ctx_md = _design_profile.get_design_dispatch_context(
@@ -3095,7 +3100,7 @@ def dispatch_change(
                 change_name, _design_source_id, exc_info=True,
             )
             return False
-    else:
+    elif _design_profile is not None:
         try:
             _ctx_md = _design_profile.get_design_dispatch_context(
                 change_name, scope, Path(project_path),
@@ -3194,13 +3199,13 @@ def dispatch_change(
     _n_test_entries = 0
     if digest_dir and change_reqs:
         _n_test_entries = len(_load_test_plan(digest_dir, change_reqs))
-    _has_design = "yes" if _design_source_id != "none" else "no"
+    _has_design_label = "yes" if _design_source_id != "none" else "no"
     _retry_n = change.redispatch_count if hasattr(change, "redispatch_count") else 0
     logger.info(
         "Dispatched %s: requirements=%d, test_plan_entries=%d, "
         "digest_dir=%s, design=%s, retry=%d",
         change_name, _n_reqs, _n_test_entries,
-        "set" if digest_dir else "empty", _has_design, _retry_n,
+        "set" if digest_dir else "empty", _has_design_label, _retry_n,
     )
 
     # ANOMALY: feature change with 0 requirements (task 1.2)

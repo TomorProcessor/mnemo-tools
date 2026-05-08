@@ -272,6 +272,19 @@ class ProjectType(ABC):
     # detect_design_source() returns "none", the context method is a no-op
     # (empty string).
 
+    def has_design_pipeline(
+        self, project_path: Path, directives: dict | None = None,
+    ) -> bool:
+        """Whether this project has an active design pipeline.
+
+        Checks the ``design_pipeline`` directive first (``"none"`` → False).
+        When ``"auto"`` (default), delegates to ``detect_design_source()``.
+        """
+        dp = (directives or {}).get("design_pipeline", "auto")
+        if dp == "none":
+            return False
+        return self.detect_design_source(project_path) != "none"
+
     def detect_design_source(self, project_path: Path) -> str:
         """Return identifier of the design source for this project, or "none".
 
