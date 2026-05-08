@@ -2545,11 +2545,122 @@ def _phase3_merge_plans(
     return merged_plan
 
 
+def load_saved_domain_plans(
+    state_file: str,
+) -> tuple[dict, dict[str, dict], dict[str, str]] | None:
+    """Load the saved Phase 1 brief + Phase 2 domain plans + per-domain hashes.
+
+    Returns `(brief, domain_plans, domain_input_hashes)` on success, or
+    `None` when the file is missing or unparseable. Capability:
+    replan-domain-plan-reuse.
+
+    A WARNING is logged on parse failure so operators can correlate with
+    a missing reuse opportunity.
+    """
+    from .paths import LineagePaths
+    try:
+        domains_file = LineagePaths.from_state_file(state_file).plan_domains_file
+    except Exception as exc:
+        logger.debug("load_saved_domain_plans: lineage resolution failed (%s)", exc)
+        return None
+    if not os.path.isfile(domains_file):
+        return None
+    try:
+        with open(domains_file) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Replan: could not load saved domain plans at %s (%s) — "
+            "proceeding with full Phase 2",
+            domains_file, exc,
+        )
+        return None
+    brief = data.get("brief", {}) or {}
+    domain_plans = data.get("domain_plans", {}) or {}
+    hashes = data.get("domain_input_hashes", {}) or {}
+    logger.info(
+        "Replan: loaded saved domain plans (%d domains, %d hashes)",
+        len(domain_plans), len(hashes),
+    )
+    return brief, domain_plans, hashes
+
+
+def resolve_domain_reuse_decisions(
+    saved_hashes: dict[str, str],
+    current_domain_data: dict,
+    current_brief: dict,
+) -> tuple[set[str], set[str]]:
+    """Decide which domains can be reused vs need re-decomposition.
+
+    Recomputes each current domain's input hash and compares to the
+    saved hash. Returns `(reuse_names, redecompose_names)`. Capability:
+    replan-domain-plan-reuse.
+
+    A domain is reused only when (a) a saved hash exists for that name,
+    AND (b) the recomputed hash byte-equals the saved one. New domains
+    in the current digest that have no saved hash are placed in
+    `redecompose_names`.
+    """
+    if not saved_hashes:
+        # No persisted hashes (legacy save format) — cannot make a
+        # confident reuse decision; redecompose everything.
+        return set(), {d["name"] for d in current_domain_data.get("domains", [])}
+
+    brief_json = json.dumps(current_brief, sort_keys=True)
+    conventions = current_domain_data.get("conventions", "")
+    reuse: set[str] = set()
+    redo: set[str] = set()
+    for domain in current_domain_data.get("domains", []):
+        name = domain.get("name", "")
+        cur_hash = _compute_domain_input_hash(
+            domain_summary=domain.get("summary", ""),
+            requirements_json=domain.get("requirements_json", ""),
+            brief_json=brief_json,
+            conventions=conventions,
+        )
+        saved = saved_hashes.get(name)
+        if saved and saved == cur_hash:
+            reuse.add(name)
+        else:
+            redo.add(name)
+    return reuse, redo
+
+
+def _compute_domain_input_hash(
+    domain_summary: str,
+    requirements_json: str,
+    brief_json: str,
+    conventions: str,
+) -> str:
+    """Compute a stable sha256 over the inputs that determine a domain plan.
+
+    Capability: replan-domain-plan-reuse (decompose-replan-optimization).
+    Used by replan to decide whether a saved domain plan is still valid.
+    Order is fixed and codified — must not depend on dict iteration order.
+    A change in the planning brief (cross-domain coordination) invalidates
+    every domain hash, which is the desired behavior.
+    """
+    payload = (
+        f"{domain_summary}\n"
+        f"{requirements_json}\n"
+        f"{brief_json}\n"
+        f"{conventions}"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _save_domain_plans(
     planning_brief: dict,
     domain_plans: dict[str, dict],
+    domain_data: dict | None = None,
 ) -> None:
-    """Save Phase 1 brief and Phase 2 domain plans for selective replan."""
+    """Save Phase 1 brief and Phase 2 domain plans for selective replan.
+
+    When `domain_data` is provided (the dict returned by `_load_domain_data`),
+    per-domain input hashes are also persisted so replan can detect which
+    domains' inputs are unchanged and reuse their plans without invoking
+    Claude. Capability: replan-domain-plan-reuse.
+    """
     from .paths import LineagePaths, SetRuntime
     try:
         rt = SetRuntime(os.getcwd())
@@ -2560,14 +2671,35 @@ def _save_domain_plans(
             os.getcwd(),
             os.path.basename(LineagePaths(os.getcwd()).plan_domains_file),
         )
+
+    # Compute per-domain input hashes when domain_data is supplied.
+    domain_input_hashes: dict[str, str] = {}
+    if domain_data:
+        brief_json = json.dumps(planning_brief, sort_keys=True)
+        conventions = domain_data.get("conventions", "")
+        for domain in domain_data.get("domains", []):
+            dname = domain.get("name", "")
+            if dname not in domain_plans:
+                continue
+            domain_input_hashes[dname] = _compute_domain_input_hash(
+                domain_summary=domain.get("summary", ""),
+                requirements_json=domain.get("requirements_json", ""),
+                brief_json=brief_json,
+                conventions=conventions,
+            )
+
     data = {
         "brief": planning_brief,
         "domain_plans": domain_plans,
+        "domain_input_hashes": domain_input_hashes,
         "created_at": datetime.now().astimezone().isoformat(),
     }
     with open(domains_file, "w") as f:
         json.dump(data, f, indent=2)
-    logger.info("Saved domain plans to %s", domains_file)
+    logger.info(
+        "Saved domain plans to %s (%d hashes)",
+        domains_file, len(domain_input_hashes),
+    )
 
 
 # Post-Phase-3 fail-fast guard against standalone test changes (regression
@@ -2752,8 +2884,9 @@ def _try_domain_parallel_decompose(
         max_parallel=max_parallel,
     )
 
-    # Save domain plans for selective replan
-    _save_domain_plans(planning_brief, domain_plans)
+    # Save domain plans for selective replan, with input hashes so replan
+    # can detect which domains' inputs are unchanged.
+    _save_domain_plans(planning_brief, domain_plans, domain_data=domain_data)
 
     # Phase 3: Merge & Resolve
     plan_data = _phase3_merge_plans(

@@ -15,15 +15,15 @@
 
 ## 0b. Tier A — Replan domain-plan reuse
 
-- [ ] 0b.1 Define `_compute_domain_input_hash(domain_summary, requirements_json, brief_json, conventions)` returning sha256 hex [REQ: domain-input-hashing]
-- [ ] 0b.2 Update `_save_domain_plans` to persist `domain_input_hashes` keyed by domain name [REQ: domain-input-hashes-persisted-alongside-plans]
-- [ ] 0b.3 Implement `load_saved_domain_plans(lineage_paths)` that returns `(brief, domain_plans, hashes)` or `None` on missing/malformed [REQ: replan-looks-up-saved-domain-plans]
-- [ ] 0b.4 In `_auto_replan_cycle` parallel path, call the loader before Phase 2; for each domain compute current hash and compare; reuse if matching [REQ: per-domain-reuse-decision]
+- [x] 0b.1 Define `_compute_domain_input_hash(domain_summary, requirements_json, brief_json, conventions)` returning sha256 hex [REQ: domain-input-hashing]
+- [x] 0b.2 Update `_save_domain_plans` to persist `domain_input_hashes` keyed by domain name [REQ: domain-input-hashes-persisted-alongside-plans]
+- [x] 0b.3 Implement `load_saved_domain_plans(lineage_paths)` that returns `(brief, domain_plans, hashes)` or `None` on missing/malformed [REQ: replan-looks-up-saved-domain-plans]
+- [x] 0b.4 In `_auto_replan_cycle` parallel path, call the loader before Phase 2; for each domain compute current hash and compare; reuse if matching [REQ: per-domain-reuse-decision]
 - [ ] 0b.5 Update `_phase2_parallel_decompose` to accept a `reuse_map: dict[str, dict]` of pre-resolved domain plans and skip those domains in the executor [REQ: per-domain-reuse-decision]
-- [ ] 0b.6 Emit `REPLAN_REUSE` event with `{reused, redecomposed, total}` after the reuse decision [REQ: reuse-telemetry-in-llm-call-events]
+- [x] 0b.6 Emit `REPLAN_REUSE` event with `{reused, redecomposed, total}` after the reuse decision [REQ: reuse-telemetry-in-llm-call-events]
 - [ ] 0b.7 In the serial path, add whole-plan reuse check: if digest hash matches prior plan AND `replan_ctx.completed` is empty, skip Claude call [REQ: reuse-applies-to-serial-path-via-whole-plan-check]
-- [ ] 0b.8 Unit test: matching hashes → reuse for that domain; non-matching → re-decompose [REQ: per-domain-reuse-decision]
-- [ ] 0b.9 Unit test: brief change invalidates all domain hashes [REQ: per-domain-reuse-decision]
+- [x] 0b.8 Unit test: matching hashes → reuse for that domain; non-matching → re-decompose [REQ: per-domain-reuse-decision]
+- [x] 0b.9 Unit test: brief change invalidates all domain hashes [REQ: per-domain-reuse-decision]
 - [ ] 0b.10 Unit test: serial-path replan with unchanged digest and empty completed list skips the LLM call [REQ: reuse-applies-to-serial-path-via-whole-plan-check]
 - [ ] 0b.11 Integration: replicate the multi-cycle retry pattern; assert second cycle re-decomposes only the affected domain [REQ: replan-looks-up-saved-domain-plans]
 

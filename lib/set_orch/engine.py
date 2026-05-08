@@ -3702,15 +3702,21 @@ def _auto_replan_cycle(
             _load_domain_data, _phase1_planning_brief,
             _decompose_single_domain, _phase2_parallel_decompose,
             _phase3_merge_plans, _save_domain_plans,
+            load_saved_domain_plans, resolve_domain_reuse_decisions,
         )
 
         logger.info("Replan: using domain-parallel pipeline (trigger=%s)", replan_trigger)
 
-        # Load saved domain plans
-        with open(domains_file) as f:
-            saved = json.load(f)
-        saved_brief = saved.get("brief", {})
-        saved_domain_plans = saved.get("domain_plans", {})
+        # Load saved domain plans + hashes (capability replan-domain-plan-reuse).
+        loaded = load_saved_domain_plans(state_file)
+        if loaded is None:
+            with open(domains_file) as f:
+                saved = json.load(f)
+            saved_brief = saved.get("brief", {})
+            saved_domain_plans = saved.get("domain_plans", {})
+            saved_hashes: dict[str, str] = {}
+        else:
+            saved_brief, saved_domain_plans, saved_hashes = loaded
 
         digest_dir = os.path.join(os.getcwd(), "set", "orchestration", "digest")
         logger.debug("Replan: digest_dir=%s, exists=%s", digest_dir, os.path.isdir(digest_dir))
@@ -3718,17 +3724,43 @@ def _auto_replan_cycle(
         from .model_config import resolve_model as _resolve_model
         model = d.default_model or _resolve_model("agent")
 
+        # Hash-based reuse decision: filter trigger-flagged domains by
+        # actual input-hash mismatch. Domains whose inputs didn't change
+        # are reused as-is. New domains (no saved hash) are always redone.
+        reuse_set, _ = resolve_domain_reuse_decisions(
+            saved_hashes, domain_data, saved_brief,
+        )
+
         if replan_trigger == "spec_change":
-            # Full re-decompose
-            logger.info("Replan: full re-decompose (spec changed)")
+            # Spec changed — most hashes will differ; let the hash check
+            # decide per-domain rather than blanket re-decompose.
+            logger.info("Replan: spec changed — hash-based reuse engaged")
             saved_brief = _phase1_planning_brief(domain_data, model=model)
-            saved_domain_plans = _phase2_parallel_decompose(domain_data, saved_brief, model=model, digest_dir=digest_dir)
+            # Brief change invalidates all hashes by construction.
+            reuse_set = set()
+            failed_domains = [d_["name"] for d_ in domain_data.get("domains", [])]
+            for dname in failed_domains:
+                domain = next((dom for dom in domain_data["domains"] if dom["name"] == dname), None)
+                if domain:
+                    _dreq_ids = [r.get("id", "") for r in domain.get("requirements", [])]
+                    saved_domain_plans[dname] = _decompose_single_domain(
+                        domain, json.dumps(saved_brief), domain_data["conventions"], model=model,
+                        test_plan_context=_build_test_plan_context(digest_dir, _dreq_ids),
+                    )
         elif replan_trigger == "e2e_failure":
             # Phase 3 only — re-merge with failure context
             logger.info("Replan: Phase 3 only (E2E failure)")
         elif replan_trigger in ("domain_failure", "coverage_gap"):
-            # Re-run failed/gap domains only
-            failed_domains = _get_domains_needing_replan(state_file, domain_data, replan_trigger)
+            # Re-run failed/gap domains only — minus those whose hash shows
+            # they're actually unchanged.
+            flagged = _get_domains_needing_replan(state_file, domain_data, replan_trigger)
+            failed_domains = [d_ for d_ in flagged if d_ not in reuse_set]
+            skipped = [d_ for d_ in flagged if d_ in reuse_set]
+            if skipped:
+                logger.info(
+                    "Replan: hash-based reuse skipped %d trigger-flagged domain(s): %s",
+                    len(skipped), skipped,
+                )
             logger.info("Replan: re-decomposing domains: %s", failed_domains)
             for dname in failed_domains:
                 domain = next((dom for dom in domain_data["domains"] if dom["name"] == dname), None)
@@ -3757,7 +3789,23 @@ def _auto_replan_cycle(
                         test_plan_context=_build_test_plan_context(digest_dir, _dreq_ids2),
                     )
 
-        _save_domain_plans(saved_brief, saved_domain_plans)
+        # Persist with hashes so the next replan can detect unchanged domains.
+        _save_domain_plans(saved_brief, saved_domain_plans, domain_data=domain_data)
+
+        # Emit REPLAN_REUSE telemetry (capability replan-domain-plan-reuse).
+        # `reuse_set` was computed above; total = current digest's domain count.
+        try:
+            total_domains = len(domain_data.get("domains", []))
+            reused_count = len(reuse_set)
+            redecomposed_count = max(0, total_domains - reused_count)
+            event_bus.emit("REPLAN_REUSE", change="", data={
+                "reused": reused_count,
+                "redecomposed": redecomposed_count,
+                "total": total_domains,
+                "trigger": replan_trigger,
+            })
+        except Exception:
+            logger.debug("Failed to emit REPLAN_REUSE event", exc_info=True)
 
         plan_json = _phase3_merge_plans(
             saved_domain_plans, saved_brief, domain_data,
