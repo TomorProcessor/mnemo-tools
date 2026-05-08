@@ -2921,6 +2921,7 @@ def dispatch_change(
         logger.debug("Failed to persist assigned_e2e_port", exc_info=True)
 
     # Config-driven env_vars → .env (after profile bootstrap, overrides profile defaults)
+    _directives: dict = {}
     try:
         _state = load_state(state_path)
         _directives = _state.extras.get("directives", {})

@@ -831,7 +831,7 @@ class ProjectType(ABC):
         table: the gate set grows by `content_tag_to_gates()[tag]` for
         every tag matched in the change's scope. It NEVER shrinks.
         Default is CoreProfile's minimal map, safe for any project type:
-            ui            → design-fidelity, i18n_check
+            ui            → i18n_check (design-fidelity added by web module)
             e2e_ui        → e2e
             server        → test
             schema        → build
@@ -839,7 +839,7 @@ class ProjectType(ABC):
             i18n_catalog  → i18n_check
         """
         return {
-            "ui": {"design-fidelity", "i18n_check"},
+            "ui": {"i18n_check"},
             "e2e_ui": {"e2e"},
             "server": {"test"},
             "schema": {"build"},

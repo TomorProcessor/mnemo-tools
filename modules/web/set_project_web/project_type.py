@@ -1260,6 +1260,11 @@ class WebProjectType(CoreProfile):
     def ignore_patterns(self) -> List[str]:
         return ["node_modules", ".next", "dist", "build", ".turbo"]
 
+    def content_tag_to_gates(self) -> dict[str, set[str]]:
+        base = super().content_tag_to_gates()
+        base.setdefault("ui", set()).add("design-fidelity")
+        return base
+
     def register_gates(self) -> list:
         """Register web-specific gates: i18n_check, e2e, lint, design-fidelity, required-components."""
         from set_orch.gate_runner import GateDefinition

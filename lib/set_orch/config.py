@@ -280,6 +280,7 @@ _VALIDATORS: dict[str, tuple[str, str | None]] = {
     "issue_diagnosed_timeout_secs": ("int_pos", None),
     "max_replan_retries": ("int_pos", None),
     "e2e_retry_limit": ("int_pos", None),
+    "design_pipeline": ("enum", r"^(auto|none)$"),
 }
 
 

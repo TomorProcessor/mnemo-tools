@@ -90,7 +90,7 @@ class TestDirectiveDefault:
 
 
 class TestConditionalGateRegistration:
-    """design-fidelity gate is only included when design pipeline is active."""
+    """register_gates() always returns design-fidelity; filtering is at verifier level."""
 
     def test_register_gates_includes_fidelity_with_v0(self, tmp_path: Path):
         from set_project_web.project_type import WebProjectType
