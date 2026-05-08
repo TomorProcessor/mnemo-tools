@@ -1,0 +1,219 @@
+# content-fixtures.yaml — seed data for the design-fidelity reference render
+#
+# This file is consumed by:
+#   - the design-fidelity gate (renders both the v0 reference and agent-built UI with this data)
+#   - E2E tests that need deterministic content to assert on
+#
+# set-design has no DB, so most fixtures are config-shape JSON, not table rows.
+
+# ─── Welcome screen recent targets ──────────────────────────────────────────
+recent_targets:
+  - path: "~/work/landing-page"
+    last_opened_at: "2026-05-06T08:14:00Z"
+    display_name: "landing-page"
+  - path: "~/work/dashboard-redesign"
+    last_opened_at: "2026-05-05T19:42:00Z"
+    display_name: "dashboard-redesign"
+  - path: "~/work/coffee-shop-prototype"
+    last_opened_at: "2026-05-04T11:08:00Z"
+    display_name: "coffee-shop-prototype"
+
+# ─── Sample target config (rendered in settings) ───────────────────────────
+sample_config:
+  version: "1.0"
+  target_path: "/Users/dev/work/landing-page"
+  dev_url: "http://localhost:3000"
+  dev_command: "pnpm dev"
+  auto_start_dev_server: true
+  model: "opus"
+  claude_session_id: "01HXYZ123ABC456DEF789"
+  active_chat_id: "01HXY456ABC789DEF012"
+  mcp_config_path: null
+  design_tokens_paths:
+    - "docs/design-system.md"
+  vision_loop: false
+  auto_commit: true
+  budget_cap_usd: null
+  created_at: "2026-05-01T09:00:00Z"
+  updated_at: "2026-05-06T08:14:00Z"
+
+# ─── Sample chat for the chat panel (3 user turns, 3 assistant turns) ───────
+sample_chat:
+  chat_id: "01HXY456ABC789DEF012"
+  title: "Hero & nav"
+  created_at: "2026-05-06T08:14:00Z"
+  events:
+    - kind: "message"
+      id: "01HXYM001"
+      role: "user"
+      content: "Add a hero with a CTA. Headline 'Build faster'. Primary button 'Get started'."
+      attachment_ids: []
+      created_at: "2026-05-06T08:14:30Z"
+    - kind: "turn"
+      id: "01HXYT001"
+      prompt_message_id: "01HXYM001"
+      state: "COMPLETED"
+      model: "opus"
+      started_at: "2026-05-06T08:14:32Z"
+      completed_at: "2026-05-06T08:14:48Z"
+      commit_sha: "abc123f"
+      files_changed: ["app/page.tsx", "components/Hero.tsx"]
+      cost_usd: 0.034
+      duration_ms: 16000
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 1
+      event: "tool_use_start"
+      tool_name: "Read"
+      tool_input: { file_path: "app/page.tsx" }
+      at: "2026-05-06T08:14:33Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 2
+      event: "tool_use_end"
+      tool_name: "Read"
+      at: "2026-05-06T08:14:33Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 3
+      event: "text_delta"
+      delta: "I'll add a hero section with the headline and CTA."
+      at: "2026-05-06T08:14:35Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 4
+      event: "tool_use_start"
+      tool_name: "Write"
+      tool_input: { file_path: "components/Hero.tsx" }
+      at: "2026-05-06T08:14:38Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 5
+      event: "tool_use_end"
+      tool_name: "Write"
+      at: "2026-05-06T08:14:39Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 6
+      event: "tool_use_start"
+      tool_name: "Edit"
+      tool_input: { file_path: "app/page.tsx" }
+      at: "2026-05-06T08:14:42Z"
+    - kind: "activity"
+      turn_id: "01HXYT001"
+      seq: 7
+      event: "tool_use_end"
+      tool_name: "Edit"
+      at: "2026-05-06T08:14:43Z"
+    - kind: "message"
+      id: "01HXYM002"
+      role: "user"
+      content: "Make the CTA blue."
+      attachment_ids: []
+      created_at: "2026-05-06T08:15:10Z"
+    - kind: "turn"
+      id: "01HXYT002"
+      prompt_message_id: "01HXYM002"
+      state: "COMPLETED"
+      model: "opus"
+      started_at: "2026-05-06T08:15:12Z"
+      completed_at: "2026-05-06T08:15:20Z"
+      commit_sha: "def456g"
+      files_changed: ["components/Hero.tsx"]
+      cost_usd: 0.012
+      duration_ms: 8000
+
+# ─── Sample git history (rendered in versions panel) ───────────────────────
+sample_commits:
+  - sha: "def456g7890abcdef1234567"
+    short_sha: "def456g"
+    message: "Update CTA color to blue"
+    author: "set-design"
+    files_changed: ["components/Hero.tsx"]
+    additions: 1
+    deletions: 1
+    at: "2026-05-06T08:15:20Z"
+    turn_id: "01HXYT002"
+    cost_usd: 0.012
+    is_revert: false
+  - sha: "abc123f7890abcdef1234567"
+    short_sha: "abc123f"
+    message: "Add hero with CTA"
+    author: "set-design"
+    files_changed: ["app/page.tsx", "components/Hero.tsx"]
+    additions: 28
+    deletions: 4
+    at: "2026-05-06T08:14:48Z"
+    turn_id: "01HXYT001"
+    cost_usd: 0.034
+    is_revert: false
+  - sha: "012345abcdef67890abcdef1"
+    short_sha: "012345a"
+    message: "Initialize from set-design template"
+    author: "set-design"
+    files_changed: []
+    additions: 142
+    deletions: 0
+    at: "2026-05-06T08:00:00Z"
+    turn_id: null  # external
+    cost_usd: null
+    is_revert: false
+
+# ─── Claude models (mirrored from catalog/claude-models.md) ─────────────────
+claude_models:
+  - id: "opus"
+    display: "Opus"
+    cli: "claude-opus-4-7"
+    per_1m_input_usd: 15.00
+    per_1m_output_usd: 75.00
+    description: "Highest quality. Default."
+  - id: "sonnet"
+    display: "Sonnet"
+    cli: "claude-sonnet-4-6"
+    per_1m_input_usd: 3.00
+    per_1m_output_usd: 15.00
+    description: "Faster, cheaper. Good for tweaks."
+  - id: "haiku"
+    display: "Haiku"
+    cli: "claude-haiku-4-5-20251001"
+    per_1m_input_usd: 1.00
+    per_1m_output_usd: 5.00
+    description: "Fastest. Quick edits."
+
+# ─── Status bar fixture ────────────────────────────────────────────────────
+status_bar_fixture:
+  target_pill:
+    path: "~/work/landing-page"
+    full: "/Users/dev/work/landing-page"
+  git_pill:
+    branch: "main"
+    sha: "def456g7890abcdef1234567"
+    short_sha: "def456g"
+    dirty: false
+  mode_pill: null  # default mode, hidden
+  claude_state:
+    state: "idle"
+    detail: null
+  cost:
+    session_usd: 0.046
+    all_time_usd: 1.234
+  conn: "connected"
+
+# ─── Errors fixture (for error-state design renders) ───────────────────────
+error_fixture:
+  error_codes:
+    - code: "TARGET_NOT_GIT_REPO"
+      message: "Folder is not a git repository."
+      surface: "dialog"
+    - code: "CLAUDE_NOT_FOUND"
+      message: "Claude CLI not in PATH."
+      surface: "banner"
+    - code: "BUILD_FAILED"
+      message: "Module not found: Can't resolve '@/components/Hero'"
+      surface: "preview-banner"
+    - code: "IMAGE_TOO_LARGE"
+      message: "File exceeds the 10 MB limit. Try a smaller image."
+      surface: "toast"
+    - code: "WS_DISCONNECTED"
+      message: "Lost connection to engine. Reconnecting…"
+      surface: "banner"

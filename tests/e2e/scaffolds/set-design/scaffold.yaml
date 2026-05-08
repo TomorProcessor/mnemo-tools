@@ -1,0 +1,10 @@
+project_type: web
+template: nextjs
+ui_library: shadcn
+
+# Design source — TSX repo generated in v0.app following the prompts in
+# docs/design-direction.md. Replace `repo` with the actual URL once pushed.
+design_source:
+  type: v0-git
+  repo: https://github.com/tatargabor/v0-set-design.git
+  ref: main
