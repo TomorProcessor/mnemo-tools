@@ -147,6 +147,18 @@ class Directives:
     # Replan divergent-plan reconciliation mode.
     divergent_plan_dir_cleanup: str = "enabled"
 
+    # decompose-replan-optimization: planner strategy routing.
+    # planner_strategy: "serial" (always single-call), "parallel" (always
+    # 3-phase), or "auto" (estimate-then-pick). Default `auto` resolves to
+    # `serial` for typical specs and only routes to `parallel` when the
+    # estimated flat-prompt would exceed the threshold below. The legacy
+    # `DOMAIN_PARALLEL_MIN_REQS = 30` heuristic in planner.py is removed in
+    # favor of this directive.
+    planner_strategy: str = "auto"
+    planner_single_call_max_input_tokens: int = field(
+        default_factory=lambda: DIRECTIVE_DEFAULTS["planner_single_call_max_input_tokens"],
+    )
+
     # ─── verify-gate-resilience-fixes: hoisted retry/circuit limits ───
     # All fields below default to DIRECTIVE_DEFAULTS values (config.py canonical).
     # Phase 4 will replace hardcoded constants in merger.py / verifier.py /
@@ -247,6 +259,12 @@ def parse_directives(raw: dict) -> Directives:
     d.loc_ambiguity_weight = _int(raw, "loc_ambiguity_weight", d.loc_ambiguity_weight)
     d.divergent_plan_dir_cleanup = _str(
         raw, "divergent_plan_dir_cleanup", d.divergent_plan_dir_cleanup,
+    )
+
+    # decompose-replan-optimization: planner strategy routing.
+    d.planner_strategy = _str(raw, "planner_strategy", d.planner_strategy)
+    d.planner_single_call_max_input_tokens = _int(
+        raw, "planner_single_call_max_input_tokens", d.planner_single_call_max_input_tokens,
     )
 
     # verify-gate-resilience-fixes: hoisted retry/circuit limits.

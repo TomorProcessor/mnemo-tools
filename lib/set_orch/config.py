@@ -115,6 +115,18 @@ DIRECTIVE_DEFAULTS: dict[str, Any] = {
     "plan_approval": False,
     "checkpoint_auto_approve": False,
     "plan_method": "api",
+    # Planner strategy directive (decompose-replan-optimization, capability
+    # planner-strategy-routing). Selects between single-call (serial) and
+    # 3-phase (parallel) decompose paths.
+    #   serial   — always single-call, regardless of digest size
+    #   parallel — always 3-phase domain-parallel
+    #   auto     — pick based on estimate_flat_prompt_tokens() vs threshold
+    # Default `auto` resolves to `serial` for typical specs and `parallel`
+    # only when the estimated flat prompt would exceed the threshold below.
+    "planner_strategy": "auto",
+    # Token threshold for the auto strategy. Default 120k leaves ~80k of the
+    # 200k Opus window for output and tool-use turns. Tunable per-project.
+    "planner_single_call_max_input_tokens": 120_000,
     "model_routing": "off",
     "team_mode": False,
     "post_phase_audit": True,
@@ -233,7 +245,9 @@ _VALIDATORS: dict[str, tuple[str, str | None]] = {
     "context_pruning": ("bool", None),
     "plan_approval": ("bool", None),
     "checkpoint_auto_approve": ("bool", None),
-    "plan_method": ("enum", r"^(api|agent)$"),
+    "plan_method": ("enum", r"^(api|agent|serial|parallel)$"),
+    "planner_strategy": ("enum", r"^(serial|parallel|auto)$"),
+    "planner_single_call_max_input_tokens": ("int_pos", None),
     "model_routing": ("enum", r"^(off|complexity)$"),
     "team_mode": ("bool", None),
     "post_phase_audit": ("bool", None),

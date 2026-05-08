@@ -327,6 +327,7 @@ def run_claude_logged(
     model: str | None = None,
     extra_args: list[str] | None = None,
     cwd: str | Path | None = None,
+    strategy: str | None = None,
 ) -> ClaudeResult:
     """Execute Claude CLI, emit LLM_CALL event, and write a verdict sidecar.
 
@@ -388,7 +389,7 @@ def run_claude_logged(
     try:
         from .events import event_bus
         emit_model = resolve_model_id(model) if model else "default"
-        event_bus.emit("LLM_CALL", change=change, data={
+        event_data = {
             "purpose": purpose,
             "model": emit_model,
             "duration_ms": result.duration_ms,
@@ -399,7 +400,13 @@ def run_claude_logged(
             "cost_usd": result.cost_usd,
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
-        })
+        }
+        # decompose-replan-optimization: tag decompose-purpose calls with the
+        # resolved planner strategy so post-run cost analysis can attribute
+        # spend per strategy (capability planner-strategy-routing).
+        if strategy is not None:
+            event_data["strategy"] = strategy
+        event_bus.emit("LLM_CALL", change=change, data=event_data)
     except Exception:
         logger.debug("Failed to emit LLM_CALL event", exc_info=True)
 

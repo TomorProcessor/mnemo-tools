@@ -168,6 +168,184 @@ def summarize_spec(
 _FORCE_STRATEGY_VALID = {"flat", "domain-parallel", "auto"}
 
 
+# ─── Planner Strategy Routing ────────────────────────────────────────
+# Capability: planner-strategy-routing (decompose-replan-optimization).
+# Default `auto` resolves to `serial` for typical specs and only routes to
+# `parallel` when the estimated flat-prompt input tokens exceed the
+# threshold. The legacy DOMAIN_PARALLEL_MIN_REQS = 30 heuristic is removed.
+
+# Default threshold: 120k leaves ~80k of the Opus 200k window for output
+# and tool-use turns. Tunable via the `planner_single_call_max_input_tokens`
+# directive.
+SINGLE_CALL_MAX_INPUT_TOKENS_DEFAULT: int = 120_000
+
+# Fixed overhead added to the file-size estimate. Covers _PLANNING_RULES
+# (~5 KB), output schema (~1 KB), test infra context (~0.5 KB), design
+# context placeholder (~2 KB), existing-specs/active-changes (~1 KB).
+_FLAT_PROMPT_FIXED_OVERHEAD_CHARS: int = 9_500
+
+# Chars-per-token estimate (rough; ~3.5 for English+JSON mix).
+_CHARS_PER_TOKEN: float = 3.5
+
+
+def estimate_flat_prompt_tokens(
+    digest_dir: str,
+    replan_ctx: dict | None = None,
+) -> int:
+    """Estimate the input-token size of the flat (single-call) decompose prompt.
+
+    Pure-Python computation. Reads digest files from disk and returns an
+    integer estimate. Never invokes Claude.
+
+    Args:
+        digest_dir: Path to `set/orchestration/digest`. Missing files are
+            treated as zero bytes (graceful fallback).
+        replan_ctx: Optional replan context dict (`completed`, `e2e_failures`,
+            `audit_gaps`). Its serialized JSON size is added to the estimate.
+
+    Returns:
+        Estimated input tokens (chars / _CHARS_PER_TOKEN).
+    """
+    total_chars = _FLAT_PROMPT_FIXED_OVERHEAD_CHARS
+
+    # Sum byte sizes of standard digest files; missing → 0.
+    if digest_dir and os.path.isdir(digest_dir):
+        for filename in (
+            "conventions.json",
+            "requirements.json",
+            "dependencies.json",
+            "ambiguities.json",
+            "index.json",
+        ):
+            path = os.path.join(digest_dir, filename)
+            try:
+                total_chars += os.path.getsize(path)
+            except OSError:
+                pass  # missing — treat as 0
+
+        # Sum all domains/*.md files.
+        domains_dir = os.path.join(digest_dir, "domains")
+        if os.path.isdir(domains_dir):
+            try:
+                for entry in os.listdir(domains_dir):
+                    if entry.endswith(".md"):
+                        try:
+                            total_chars += os.path.getsize(
+                                os.path.join(domains_dir, entry),
+                            )
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+    # Replan context — serialize and count.
+    if replan_ctx:
+        try:
+            total_chars += len(json.dumps(replan_ctx))
+        except (TypeError, ValueError):
+            pass
+
+    return int(total_chars / _CHARS_PER_TOKEN)
+
+
+def _resolve_planner_strategy(
+    digest_dir: str,
+    replan_ctx: dict | None = None,
+    project_dir: str | None = None,
+) -> tuple[str, dict]:
+    """Resolve the planner strategy via directive + threshold check.
+
+    Precedence (high → low):
+      1. env var SET_ORCH_PLANNER_STRATEGY
+      2. orchestration.yaml::planner.strategy
+      3. state.extras.directives.planner_strategy
+      4. default `auto`
+
+    When the resolved strategy is `auto`, run `estimate_flat_prompt_tokens`
+    and pick `serial` if estimate ≤ threshold, else `parallel`.
+
+    Returns:
+        (strategy: "serial"|"parallel", debug_info: dict). debug_info has
+        keys `source`, `estimated_tokens`, `threshold`, `raw_directive`.
+    """
+    cwd = Path(project_dir) if project_dir else Path(os.getcwd())
+    debug: dict[str, Any] = {
+        "source": "default",
+        "raw_directive": "auto",
+        "estimated_tokens": 0,
+        "threshold": SINGLE_CALL_MAX_INPUT_TOKENS_DEFAULT,
+    }
+
+    raw = os.environ.get("SET_ORCH_PLANNER_STRATEGY")
+    if raw:
+        debug["source"] = "env"
+        debug["raw_directive"] = raw
+
+    if raw is None:
+        # orchestration.yaml::planner.strategy
+        for path in (cwd / ".claude" / "orchestration.yaml", cwd / "orchestration.yaml"):
+            if not path.is_file():
+                continue
+            try:
+                import yaml as _yaml
+                with open(path) as _fh:
+                    data = _yaml.safe_load(_fh) or {}
+            except Exception:
+                continue
+            planner_section = data.get("planner") if isinstance(data, dict) else None
+            if isinstance(planner_section, dict) and "strategy" in planner_section:
+                raw = planner_section.get("strategy")
+                debug["source"] = f"orchestration.yaml::{path.name}"
+                debug["raw_directive"] = str(raw)
+                # Threshold override may also be in the same file.
+                threshold_override = planner_section.get("single_call_max_input_tokens")
+                if isinstance(threshold_override, int) and threshold_override > 0:
+                    debug["threshold"] = threshold_override
+                break
+
+    if raw is None:
+        # state.extras.directives.planner_strategy
+        try:
+            from .paths import LineagePaths as _LP
+            state_path = _LP(str(cwd)).state_file
+            if os.path.isfile(state_path):
+                with open(state_path) as _sf:
+                    _sd = json.load(_sf)
+                directives = _sd.get("extras", {}).get("directives", {})
+                if "planner_strategy" in directives:
+                    raw = directives["planner_strategy"]
+                    debug["source"] = "state.directives"
+                    debug["raw_directive"] = str(raw)
+                threshold_override = directives.get("planner_single_call_max_input_tokens")
+                if isinstance(threshold_override, int) and threshold_override > 0:
+                    debug["threshold"] = threshold_override
+        except Exception:
+            pass
+
+    if raw is None or raw not in ("serial", "parallel", "auto"):
+        if raw not in (None, "auto"):
+            logger.warning(
+                "Unknown planner.strategy=%r — falling back to 'auto'", raw,
+            )
+        raw = "auto"
+        if debug["source"] == "default":
+            debug["raw_directive"] = "auto"
+
+    if raw in ("serial", "parallel"):
+        return raw, debug
+
+    # auto — estimate and pick.
+    estimated = estimate_flat_prompt_tokens(digest_dir, replan_ctx)
+    debug["estimated_tokens"] = estimated
+    threshold = debug["threshold"]
+    chosen = "serial" if estimated <= threshold else "parallel"
+    logger.info(
+        "planner.strategy=auto resolved=%s estimated_tokens=%d threshold=%d",
+        chosen, estimated, threshold,
+    )
+    return chosen, debug
+
+
 def _read_force_strategy(project_dir: str | None = None) -> str:
     """Return the configured planner.force_strategy, or 'auto' if unset/invalid."""
     cwd = Path(project_dir) if project_dir else Path(os.getcwd())
@@ -1819,6 +1997,7 @@ def enrich_plan_metadata(
     plan_version: int = 1,
     replan_cycle: int | None = None,
     state_path: str | None = None,
+    strategy: str | None = None,
 ) -> dict:
     """Add metadata fields to a raw plan JSON.
 
@@ -1837,7 +2016,14 @@ def enrich_plan_metadata(
         Enriched plan dict with metadata.
     """
     plan_phase = "iteration" if replan_cycle is not None else "initial"
-    plan_method = os.environ.get("_PLAN_METHOD", "api")
+    # decompose-replan-optimization: record the resolved strategy in
+    # plan_method so post-run cost analysis can attribute spend per
+    # strategy. `strategy` argument wins; env var is honored for back-
+    # compat with older callers; default `api` preserves today's value.
+    if strategy is not None:
+        plan_method = strategy
+    else:
+        plan_method = os.environ.get("_PLAN_METHOD", "api")
 
     # Compute input hash
     input_hash = ""
@@ -2138,7 +2324,9 @@ def _phase1_planning_brief(
     # No --max-turns: the prompt asks for JSON output, model self-terminates on
     # end_turn. Hardcoded caps preemptively killed legitimate big-spec runs.
     # Timeout remains as a silent-hang circuit-breaker.
-    result = run_claude_logged(prompt, purpose="decompose_brief", timeout=1800, model=model)
+    result = run_claude_logged(
+        prompt, purpose="decompose_brief", timeout=1800, model=model, strategy="parallel",
+    )
     if result.exit_code != 0:
         raise RuntimeError(f"Phase 1 (planning brief) failed (exit {result.exit_code})")
 
@@ -2234,7 +2422,9 @@ def _decompose_single_domain(
     # No --max-turns: domains with I/O exploration (admin reading prisma schema,
     # auth checking existing setup) need >5 turns; cap was the recurring blocker
     # for craftbrew-scale specs. Timeout 1800s is the silent-hang safety net.
-    result = run_claude_logged(prompt, purpose="decompose_domain", timeout=1800, model=model)
+    result = run_claude_logged(
+        prompt, purpose="decompose_domain", timeout=1800, model=model, strategy="parallel",
+    )
     if result.exit_code != 0:
         raise RuntimeError(f"Phase 2 domain '{domain['name']}' failed (exit {result.exit_code})")
 
@@ -2340,7 +2530,9 @@ def _phase3_merge_plans(
 
     logger.info("Phase 3: merging %d domain plans", len(domain_plans))
     # No --max-turns: see decompose_brief / decompose_domain rationale.
-    result = run_claude_logged(prompt, purpose="decompose_merge", timeout=1800, model=model)
+    result = run_claude_logged(
+        prompt, purpose="decompose_merge", timeout=1800, model=model, strategy="parallel",
+    )
     if result.exit_code != 0:
         raise RuntimeError(f"Phase 3 (merge) failed (exit {result.exit_code})")
 
@@ -2452,6 +2644,58 @@ def _assert_no_standalone_test_changes(plan_data: dict, project_path: str = ".")
                 f"with their feature change. See "
                 f"openspec/changes/decompose-tests-bundled-with-features/."
             )
+
+
+def _run_serial_decompose(
+    *,
+    input_mode: str,
+    input_path: str,
+    replan_ctx: dict | None,
+    design_context: str,
+    test_infra_context: str,
+    team_mode: bool,
+    model: Optional[str],
+    strategy: str = "serial",
+) -> dict:
+    """Run a single-call (flat) decompose. Returns the parsed plan dict.
+
+    This is the primary path for `planner.strategy=serial` and the fallback
+    for `parallel` failures. The model handles a flat prompt for typical
+    specs; in-call tool turns hit the prompt cache after turn 1 (observed:
+    cache_read up to 500k tokens within a single 992 s call).
+
+    Capability: planner-strategy-routing (decompose-replan-optimization).
+    """
+    from .subprocess_utils import run_claude_logged
+    from .templates import render_planning_prompt
+
+    context = build_decomposition_context(
+        input_mode, input_path,
+        replan_ctx=replan_ctx,
+        design_context=design_context,
+        test_infra_context=test_infra_context,
+        team_mode=team_mode,
+    )
+    prompt = render_planning_prompt(**context)
+
+    # Tag the LLM_CALL event with the resolved strategy so post-run cost
+    # analysis can attribute spend per strategy.
+    result = run_claude_logged(
+        prompt, purpose="decompose", timeout=1800, model=model, strategy=strategy,
+    )
+    if result.exit_code != 0:
+        raise RuntimeError(f"Serial decompose failed (exit {result.exit_code})")
+
+    plan_data = _parse_plan_response(result.stdout)
+    if not plan_data:
+        debug_path = Path("/tmp/set-decompose-response.txt")
+        debug_path.write_text(result.stdout[:10000] if result.stdout else "(empty)")
+        logger.error(
+            "Serial decompose response dumped to %s (len=%d)",
+            debug_path, len(result.stdout or ""),
+        )
+        raise RuntimeError("Could not parse plan JSON from Claude response")
+    return plan_data
 
 
 def _try_domain_parallel_decompose(
@@ -2625,96 +2869,52 @@ def run_planning_pipeline(
     except Exception:
         pass
 
-    # 5. Domain-parallel decompose (digest mode) or single-call (brief/spec)
-    # Threshold: domain-parallel only for large specs (30+ requirements)
-    DOMAIN_PARALLEL_MIN_REQS = 30
+    # 5. Strategy routing (capability planner-strategy-routing).
+    # decompose-replan-optimization: serial single-call is the default for
+    # any input mode. The 3-phase domain-parallel path is opt-in via the
+    # `planner.strategy` directive or auto-selected for very large specs.
+    # The legacy DOMAIN_PARALLEL_MIN_REQS = 30 heuristic has been removed.
+    resolved_strategy, strategy_debug = _resolve_planner_strategy(
+        digest_dir if input_mode == "digest" else "",
+        replan_ctx,
+    )
 
-    if input_mode == "digest":
-        # Count requirements to decide decompose strategy
-        req_count = 0
-        try:
-            req_path = os.path.join(digest_dir, "requirements.json")
-            if os.path.isfile(req_path):
-                with open(req_path) as _rf:
-                    req_count = len(json.load(_rf).get("requirements", []))
-        except Exception:
-            pass
-
-        force_strategy = _read_force_strategy()
-
-        if force_strategy == "flat":
-            chosen_strategy = "flat"
-            source = "force_strategy"
-        elif force_strategy == "domain-parallel":
-            chosen_strategy = "domain-parallel"
-            source = "force_strategy"
-        else:
-            chosen_strategy = (
-                "domain-parallel"
-                if req_count >= DOMAIN_PARALLEL_MIN_REQS
-                else "flat"
-            )
-            source = "threshold"
-
+    # `parallel` is only meaningful for digest mode (it needs domain
+    # summaries to fan out). For brief/spec input we silently fall back to
+    # serial — the model handles a flat prompt fine.
+    if resolved_strategy == "parallel" and input_mode != "digest":
         logger.info(
-            "decompose strategy=%s, source=%s, req_count=%d, threshold=%d",
-            chosen_strategy, source, req_count, DOMAIN_PARALLEL_MIN_REQS,
+            "planner.strategy=parallel requested but input_mode=%s "
+            "(no domain summaries) — falling back to serial",
+            input_mode,
         )
+        resolved_strategy = "serial"
 
-        plan_data = None
-        if chosen_strategy == "domain-parallel":
-            try:
-                plan_data = _try_domain_parallel_decompose(
-                    digest_dir, state_path, test_infra_context, design_context,
-                    model, max_parallel, replan_ctx, team_mode,
-                )
-            except Exception as e:
-                logger.warning("Domain-parallel decompose failed (%s) — falling back to single-call", e)
+    plan_data: dict | None = None
 
-        if plan_data is None:
-            # Fallback: single-call decompose (same path as brief/spec mode)
-            logger.info("Using single-call decompose fallback for digest mode")
-            context = build_decomposition_context(
-                input_mode, input_path,
-                replan_ctx=replan_ctx,
-                design_context=design_context,
-                test_infra_context=test_infra_context,
-                team_mode=team_mode,
+    if resolved_strategy == "parallel":
+        try:
+            plan_data = _try_domain_parallel_decompose(
+                digest_dir, state_path, test_infra_context, design_context,
+                model, max_parallel, replan_ctx, team_mode,
             )
-            from .templates import render_planning_prompt
-            prompt = render_planning_prompt(**context)
-            # No --max-turns: model self-terminates on JSON output; cap blocked
-            # big specs needing tool exploration before final plan.
-            result = run_claude_logged(prompt, purpose="decompose", timeout=1800, model=model)
-            if result.exit_code != 0:
-                raise RuntimeError(f"Claude decomposition failed (exit {result.exit_code})")
-            plan_data = _parse_plan_response(result.stdout)
-            if not plan_data:
-                raise RuntimeError("Could not parse decomposition response")
-    else:
-        # ── Single-call flow for brief/spec mode ──
-        context = build_decomposition_context(
-            input_mode, input_path,
+        except Exception as e:
+            logger.warning(
+                "Domain-parallel decompose failed (%s) — falling back to serial single-call",
+                e,
+            )
+
+    if plan_data is None:
+        plan_data = _run_serial_decompose(
+            input_mode=input_mode,
+            input_path=input_path,
             replan_ctx=replan_ctx,
             design_context=design_context,
             test_infra_context=test_infra_context,
             team_mode=team_mode,
+            model=model,
+            strategy=resolved_strategy,
         )
-
-        from .templates import render_planning_prompt
-        prompt = render_planning_prompt(**context)
-
-        # No --max-turns: model self-terminates on JSON output.
-        result = run_claude_logged(prompt, purpose="decompose", timeout=1800, model=model)
-        if result.exit_code != 0:
-            raise RuntimeError(f"Claude planning call failed (exit {result.exit_code})")
-
-        plan_data = _parse_plan_response(result.stdout)
-        if not plan_data:
-            debug_path = Path("/tmp/set-decompose-response.txt")
-            debug_path.write_text(result.stdout[:10000] if result.stdout else "(empty)")
-            logger.error("Decompose response dumped to %s (len=%d)", debug_path, len(result.stdout or ""))
-            raise RuntimeError("Could not parse plan JSON from Claude response")
 
     # 8. Validate
     plan_file_tmp = "/tmp/set-plan-validate.json"
@@ -2734,6 +2934,7 @@ def run_planning_pipeline(
         input_path,
         replan_cycle=replan_cycle,
         state_path=state_path,
+        strategy=resolved_strategy,
     )
 
     return plan_data
