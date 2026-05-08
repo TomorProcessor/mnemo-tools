@@ -476,10 +476,18 @@ def execute_design_fidelity_gate(
 
     project_path = _resolve_project_path(wt_path, change)
     if project_path is None:
+        # Neither `scaffold.yaml` nor `v0-export/` exists in the worktree or
+        # any parent — the project simply isn't using the v0 design pipeline.
+        # That's a SKIP, not a FAIL: failing here forces the agent into a
+        # retry with no actionable remediation, so users end up committing
+        # a stub `scaffold.yaml` purely to silence the gate.
+        logger.info(
+            "design-fidelity skip for %s: no scaffold.yaml or v0-export under %s",
+            change_name, wt_path,
+        )
         return GateResult(
-            "design-fidelity", "fail",
-            output="worktree-path-unknown",
-            retry_context="cannot locate consumer project path for fidelity gate",
+            "design-fidelity", "skipped",
+            output="skipped-no-design-source",
         )
 
     # Skip when no v0 source is declared.

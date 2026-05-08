@@ -233,6 +233,32 @@ def test_design_fidelity_runs_on_shell_mounting_change_types():
         )
 
 
+def test_gate_skips_when_no_scaffold_or_v0_export(tmp_path: Path):
+    """Gate must SKIP (not FAIL) when project has no v0 design source.
+
+    When the worktree has neither `scaffold.yaml` nor `v0-export/`, the
+    project isn't using the v0 design pipeline. Failing here forces the
+    agent into a retry loop with no actionable remediation.
+    """
+    from set_project_web.v0_fidelity_gate import execute_design_fidelity_gate
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "package.json").write_text('{"name":"x"}')
+
+    class FakeChange:
+        name = "test-change"
+        change_type = "feature"
+        extras: dict = {}
+
+    result = execute_design_fidelity_gate("test-change", FakeChange(), str(wt))
+    assert result.status == "skipped", (
+        f"expected skip when no scaffold/v0-export, got {result.status} "
+        f"(output={result.output!r}, retry_context={result.retry_context!r})"
+    )
+    assert "no-design-source" in result.output
+
+
 def test_warn_only_flag_read(tmp_path: Path):
     import yaml
 
