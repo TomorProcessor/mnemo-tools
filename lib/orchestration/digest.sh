@@ -54,6 +54,7 @@ USAGE
 
     local run_args=(--spec "$abs_spec_path")
     $dry_run && run_args+=(--dry-run)
+    ${SINGLE_FILE_SPEC:-false} && run_args+=(--single-file)
 
     local result
     result=$(set-orch-core digest run "${run_args[@]}" 2>/dev/null) || {
@@ -89,7 +90,9 @@ USAGE
 
 scan_spec_directory() {
     local spec_path="$1"
-    set-orch-core digest scan --spec "$spec_path"
+    local args=(--spec "$spec_path")
+    ${SINGLE_FILE_SPEC:-false} && args+=(--single-file)
+    set-orch-core digest scan "${args[@]}"
 }
 
 check_digest_freshness() {

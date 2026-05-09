@@ -1122,6 +1122,7 @@ def cmd_digest(args):
             dry_run=args.dry_run,
             digest_dir=getattr(args, "dir", None) or _default_digest_dir(),
             bypass_cache=getattr(args, "no_digest_cache", False),
+            single_file=getattr(args, "single_file", False),
         )
         if result.validation_warnings:
             for w in result.validation_warnings:
@@ -1155,12 +1156,15 @@ def cmd_digest(args):
         sys.exit(0)
 
     elif args.digest_cmd == "freshness":
-        result = check_digest_freshness(args.spec, args.dir)
+        result = check_digest_freshness(
+            args.spec, args.dir,
+            single_file=getattr(args, "single_file", False),
+        )
         print(json.dumps({"freshness": result}))
         sys.exit(0)
 
     elif args.digest_cmd == "scan":
-        scan = scan_spec_directory(args.spec)
+        scan = scan_spec_directory(args.spec, single_file=getattr(args, "single_file", False))
         print(json.dumps({
             "file_count": scan.file_count,
             "source_hash": scan.source_hash,
@@ -1871,6 +1875,11 @@ def main():
         action="store_true",
         help="purge the digest cache before running",
     )
+    dig_run.add_argument(
+        "--single-file",
+        action="store_true",
+        help="treat spec as a single file, never expand to parent directory",
+    )
 
     dig_val = dig_sub.add_parser("validate", help="Validate existing digest")
     dig_val.add_argument("--dir", default=None, help="Digest directory (default: resolver)")
@@ -1881,9 +1890,11 @@ def main():
     dig_fresh = dig_sub.add_parser("freshness", help="Check digest freshness")
     dig_fresh.add_argument("--spec", required=True, help="Spec directory or file path")
     dig_fresh.add_argument("--dir", default=None, help="Digest directory (default: resolver)")
+    dig_fresh.add_argument("--single-file", action="store_true", help="treat spec as single file")
 
     dig_scan = dig_sub.add_parser("scan", help="Scan spec directory")
     dig_scan.add_argument("--spec", required=True, help="Spec directory or file path")
+    dig_scan.add_argument("--single-file", action="store_true", help="treat spec as single file")
 
     dig_bp = dig_sub.add_parser("build-prompt", help="Build digest prompt from spec")
     dig_bp.add_argument("--spec", required=True, help="Spec directory or file path")

@@ -98,11 +98,16 @@ class DigestResult:
 # Migrated from: digest.sh:scan_spec_directory()
 
 
-def scan_spec_directory(spec_path: str | Path) -> ScanResult:
+def scan_spec_directory(
+    spec_path: str | Path, *, single_file: bool = False,
+) -> ScanResult:
     """Recursively scan a spec directory or single file for spec files.
 
     Args:
         spec_path: Path to spec directory or single file.
+        single_file: When True, never expand a master file to its parent
+            directory. Use this when the spec is self-contained and lives
+            alongside unrelated docs.
 
     Returns:
         ScanResult with file list, hash, and master file detection.
@@ -117,26 +122,29 @@ def scan_spec_directory(spec_path: str | Path) -> ScanResult:
     files: list[Path] = []
 
     if path.is_file():
-        # If the file looks like a master file, scan its parent directory
-        # to pick up sub-files (catalog/, features/, design/, etc.)
-        parent = path.parent
-        is_master = path.name in _MASTER_NAMES or bool(
-            re.match(r"^v\d+-.*\.md$", path.name)
-        )
-        if is_master and parent.is_dir():
-            sibling_files = _find_spec_files(parent)
-            if len(sibling_files) > 1:
-                # Found sub-files — scan the whole directory instead
-                path = parent
-                files = sibling_files
-                logger.info(
-                    "Master file detected (%s), scanning parent dir: %s (%d files)",
-                    spec_path, parent, len(files),
-                )
+        if single_file:
+            files = [Path(spec_path)]
+        else:
+            # If the file looks like a master file, scan its parent directory
+            # to pick up sub-files (catalog/, features/, design/, etc.)
+            parent = path.parent
+            is_master = path.name in _MASTER_NAMES or bool(
+                re.match(r"^v\d+-.*\.md$", path.name)
+            )
+            if is_master and parent.is_dir():
+                sibling_files = _find_spec_files(parent)
+                if len(sibling_files) > 1:
+                    # Found sub-files — scan the whole directory instead
+                    path = parent
+                    files = sibling_files
+                    logger.info(
+                        "Master file detected (%s), scanning parent dir: %s (%d files)",
+                        spec_path, parent, len(files),
+                    )
+                else:
+                    files = [Path(spec_path)]
             else:
                 files = [Path(spec_path)]
-        else:
-            files = [Path(spec_path)]
     else:
         files = _find_spec_files(path)
 
@@ -1304,6 +1312,8 @@ def merge_planner_resolutions(
 def check_digest_freshness(
     spec_path: str | Path,
     digest_dir: str = DIGEST_DIR,
+    *,
+    single_file: bool = False,
 ) -> str:
     """Compare spec content hash vs stored digest hash.
 
@@ -1326,7 +1336,7 @@ def check_digest_freshness(
     stored_hash = index_data.get("source_hash", "")
 
     try:
-        current_scan = scan_spec_directory(spec_path)
+        current_scan = scan_spec_directory(spec_path, single_file=single_file)
     except (FileNotFoundError, OSError):
         return "error"
 
@@ -1357,6 +1367,7 @@ def run_digest(
     model: Optional[str] = None,
     dry_run: bool = False,
     bypass_cache: bool = False,
+    single_file: bool = False,
 ) -> DigestRunResult:
     """Run the full digest pipeline: scan → prompt → API call → parse → validate → write.
 
@@ -1375,7 +1386,7 @@ def run_digest(
     """
     # 1. Scan spec files
     try:
-        scan = scan_spec_directory(spec_path)
+        scan = scan_spec_directory(spec_path, single_file=single_file)
     except FileNotFoundError as e:
         return DigestRunResult(ok=False, error=str(e))
 

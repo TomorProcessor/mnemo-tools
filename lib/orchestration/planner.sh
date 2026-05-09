@@ -143,6 +143,9 @@ cmd_plan() {
     export REQUIRE_FULL_COVERAGE
     REQUIRE_FULL_COVERAGE=$(echo "$directives" | jq -r '.require_full_coverage // false')
 
+    export SINGLE_FILE_SPEC
+    SINGLE_FILE_SPEC=$(echo "$directives" | jq -r '.single_file_spec // false')
+
     local plan_method
     plan_method=$(echo "$directives" | jq -r '.plan_method // "api"')
 
