@@ -456,12 +456,18 @@ def parse_digest_response(raw_response: str) -> DigestResult:
     raise ValueError("Could not parse digest JSON from LLM output")
 
 
+def _coerce_str(val: object) -> str:
+    if isinstance(val, str):
+        return val
+    return json.dumps(val, indent=2, ensure_ascii=False) if val else ""
+
+
 def _dict_to_digest_result(data: dict) -> DigestResult:
     """Convert a parsed dict to DigestResult."""
     return DigestResult(
         file_classifications=data.get("file_classifications", {}),
         conventions=data.get("conventions", {"categories": []}),
-        data_definitions=data.get("data_definitions", ""),
+        data_definitions=_coerce_str(data.get("data_definitions", "")),
         requirements=data.get("requirements", []),
         domains=data.get("domains", []),
         dependencies=data.get("dependencies", []),
@@ -510,9 +516,11 @@ def write_digest_output(
         _write_json(Path(tmp_dir) / "conventions.json", digest.conventions)
 
         # data-definitions.md
+        _dd = digest.data_definitions or "No data definitions found."
+        if not isinstance(_dd, str):
+            _dd = json.dumps(_dd, indent=2, ensure_ascii=False)
         (Path(tmp_dir) / "data-definitions.md").write_text(
-            digest.data_definitions or "No data definitions found.",
-            encoding="utf-8",
+            _dd, encoding="utf-8",
         )
 
         # requirements.json
