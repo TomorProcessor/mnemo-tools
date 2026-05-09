@@ -732,8 +732,10 @@ except:
         fi
         # Fallback: if primary done criteria says not done, check tasks.md
         # Pass $change_name so we only find THIS change's tasks.md, not a sibling's
+        # Also require impl files in the diff — without this, an agent that checks
+        # off tasks without implementing bypasses the primary done-check via fallback.
         if ! $early_done && [[ "$done_criteria" != "tasks" && "$done_criteria" != "test" && "$done_criteria" != "build" && "$done_criteria" != "merge" ]]; then
-            if find_tasks_file "$wt_path" "$change_name" &>/dev/null && check_tasks_done "$wt_path" "$change_name" 2>/dev/null; then
+            if find_tasks_file "$wt_path" "$change_name" &>/dev/null && check_tasks_done "$wt_path" "$change_name" 2>/dev/null && _has_impl_files_in_diff "$wt_path"; then
                 early_done=true
                 stall_count=0
                 warn "Early done by tasks.md fallback (primary criteria '$done_criteria' said not done)"
@@ -978,8 +980,9 @@ except:
         # If primary criteria says not done, check if tasks.md has all tasks [x]
         # Skip fallback for test/build/merge — those have objective pass/fail criteria
         # Pass $change_name so we only find THIS change's tasks.md, not a sibling's
+        # Also require impl files — prevents false-pass when agent checks tasks without implementing
         if ! $is_done && [[ "$done_criteria" != "tasks" && "$done_criteria" != "test" && "$done_criteria" != "build" && "$done_criteria" != "merge" ]]; then
-            if find_tasks_file "$wt_path" "$change_name" &>/dev/null && check_tasks_done "$wt_path" "$change_name" 2>/dev/null; then
+            if find_tasks_file "$wt_path" "$change_name" &>/dev/null && check_tasks_done "$wt_path" "$change_name" 2>/dev/null && _has_impl_files_in_diff "$wt_path"; then
                 is_done=true
                 warn "Done by tasks.md fallback (primary criteria '$done_criteria' said not done)"
             fi

@@ -29,10 +29,10 @@ test_command: pnpm test
 # meaning (e2e gate's timeout guard surfaces over-budget runs as FAIL).
 e2e_timeout: 3600
 
-# Replan cycles — kept lower than the framework default (5) because most
-# web scaffolds converge in 1-2 cycles; if more are needed it's usually a
-# planner-level bug, not a transient.
-max_replan_cycles: 2
+# Replan cycles — kept lower than the framework default (5). Complex specs
+# (30+ changes, 50+ requirements) need 3; anything beyond usually indicates
+# a planner-level bug, not a transient.
+max_replan_cycles: 3
 
 # ─── Model selection ────────────────────────────────────────────────
 #

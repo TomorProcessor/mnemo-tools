@@ -966,15 +966,15 @@ def cmd_loop(args):
 
     elif args.loop_cmd == "check-done":
         from .loop_tasks import is_done
-        done = is_done(args.wt_path, args.done_criteria)
+        done = is_done(args.wt_path, args.done_criteria, getattr(args, "change", "") or "")
         json.dump({"done": done}, sys.stdout)
         print()
         sys.exit(0 if done else 1)
 
     elif args.loop_cmd == "detect-action":
         from .loop_prompt import detect_next_change_action
-        action = detect_next_change_action(args.wt_path, targeted=args.change or None)
-        json.dump({"action": action.action, "change": action.change}, sys.stdout)
+        action = detect_next_change_action(args.wt_path, args.change or "")
+        json.dump({"action": action}, sys.stdout)
         print()
         sys.exit(0)
 
@@ -1985,6 +1985,7 @@ def main():
     l_done = loop_sub.add_parser("check-done", help="Check if loop is done")
     l_done.add_argument("--wt-path", required=True, help="Worktree path")
     l_done.add_argument("--done-criteria", default="tasks", help="Done criteria")
+    l_done.add_argument("--change", default="", help="Target change name")
 
     l_action = loop_sub.add_parser("detect-action", help="Detect next OpenSpec change action")
     l_action.add_argument("--wt-path", required=True, help="Worktree path")

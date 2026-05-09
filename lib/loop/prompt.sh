@@ -2,6 +2,28 @@
 # set-loop prompt building: detect next change action, build Claude prompts
 # Dependencies: lib/loop/state.sh and lib/loop/tasks.sh must be sourced first
 
+# Check whether the branch has any non-spec implementation files in the diff.
+# Returns 0 (true) if impl files exist, 1 (false) if only spec/doc artifacts.
+_has_impl_files_in_diff() {
+    local wt_path="$1"
+    local main_branch
+    main_branch=$(git -C "$wt_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's@^refs/remotes/origin/@@' || true)
+    if [[ -z "$main_branch" ]]; then
+        if git -C "$wt_path" show-ref --verify --quiet refs/heads/main 2>/dev/null; then
+            main_branch="main"
+        elif git -C "$wt_path" show-ref --verify --quiet refs/heads/master 2>/dev/null; then
+            main_branch="master"
+        else
+            main_branch="main"
+        fi
+    fi
+    local impl_files
+    impl_files=$(git -C "$wt_path" diff --name-only "$main_branch"...HEAD \
+        -- ':!openspec/' ':!docs/' 2>/dev/null || true)
+    [[ -n "$impl_files" ]]
+}
+
 # Detect the next OpenSpec change action needed.
 # Args: $1=wt_path, $2=target_change (optional — if set, only inspect that change)
 # Returns: "ff:<change-name>" or "apply:<change-name>" or "done" or "none"
@@ -38,6 +60,15 @@ detect_next_change_action() {
         unchecked=${unchecked//[^0-9]/}
         unchecked=${unchecked:-0}
         if [[ "$unchecked" -gt 0 ]]; then
+            echo "apply:$target_change"
+            return
+        fi
+
+        # All tasks [x] — verify actual implementation exists in the diff.
+        # Without this, an agent that checks off tasks without implementing
+        # (or a stale branch with pre-checked artifacts) declares "done"
+        # with zero feature code.
+        if ! _has_impl_files_in_diff "$wt_path"; then
             echo "apply:$target_change"
             return
         fi
@@ -107,6 +138,12 @@ detect_next_change_action() {
         unchecked=${unchecked//[^0-9]/}  # Strip non-digit chars
         unchecked=${unchecked:-0}
         if [[ "$unchecked" -gt 0 ]]; then
+            echo "apply:$change"
+            return
+        fi
+
+        # Check 3: All tasks [x] — verify impl files exist in diff
+        if ! _has_impl_files_in_diff "$wt_path"; then
             echo "apply:$change"
             return
         fi

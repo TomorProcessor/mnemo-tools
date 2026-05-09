@@ -61,11 +61,42 @@ class TestDetectTargeted:
             f.write("- [x] Done\n- [ ] Pending\n")
         assert detect_next_change_action(wt, "my-change") == "apply:my-change"
 
-    def test_all_checked_done(self, wt):
+    def test_all_checked_no_impl_apply(self, wt):
+        """All tasks [x] but no implementation files in diff → apply (not done)."""
         change_dir = os.path.join(wt, "openspec", "changes", "my-change")
         os.makedirs(change_dir)
         with open(os.path.join(change_dir, "tasks.md"), "w") as f:
             f.write("- [x] Done\n- [x] Also done\n")
+        # No git repo → _has_impl_files_in_diff returns False → apply
+        assert detect_next_change_action(wt, "my-change") == "apply:my-change"
+
+    def test_all_checked_with_impl_done(self, tmp_dir):
+        """All tasks [x] AND impl files in git diff → done."""
+        import subprocess
+
+        wt = os.path.join(tmp_dir, "git-wt")
+        os.makedirs(os.path.join(wt, ".claude"))
+        subprocess.run(["git", "init", "-b", "main", wt], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "--allow-empty", "-m", "init"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", wt, "checkout", "-b", "change/my-change"],
+            capture_output=True,
+        )
+        change_dir = os.path.join(wt, "openspec", "changes", "my-change")
+        os.makedirs(change_dir)
+        with open(os.path.join(change_dir, "tasks.md"), "w") as f:
+            f.write("- [x] Done\n")
+        os.makedirs(os.path.join(wt, "src"))
+        with open(os.path.join(wt, "src", "app.tsx"), "w") as f:
+            f.write("export default function App() {}\n")
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "-m", "impl"],
+            capture_output=True,
+        )
         assert detect_next_change_action(wt, "my-change") == "done"
 
 
@@ -88,25 +119,55 @@ class TestDetectScanAll:
             f.write("- [ ] Task\n")
         assert detect_next_change_action(wt) == "apply:feature-a"
 
-    def test_all_done(self, wt):
+    def test_all_checked_no_impl_apply(self, wt):
+        """Scan-all: all tasks [x] but no impl files → apply."""
         change_dir = os.path.join(wt, "openspec", "changes", "feature-a")
         os.makedirs(change_dir)
         with open(os.path.join(change_dir, "tasks.md"), "w") as f:
             f.write("- [x] Done\n")
+        # No git repo → no impl files → apply
+        assert detect_next_change_action(wt) == "apply:feature-a"
+
+    def test_all_checked_with_impl_done(self, tmp_dir):
+        """Scan-all: all tasks [x] AND impl files → done."""
+        import subprocess
+
+        wt = os.path.join(tmp_dir, "git-wt")
+        os.makedirs(os.path.join(wt, ".claude"))
+        subprocess.run(["git", "init", "-b", "main", wt], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "--allow-empty", "-m", "init"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", wt, "checkout", "-b", "change/feature-a"],
+            capture_output=True,
+        )
+        change_dir = os.path.join(wt, "openspec", "changes", "feature-a")
+        os.makedirs(change_dir)
+        with open(os.path.join(change_dir, "tasks.md"), "w") as f:
+            f.write("- [x] Done\n")
+        os.makedirs(os.path.join(wt, "src"))
+        with open(os.path.join(wt, "src", "index.ts"), "w") as f:
+            f.write("console.log('hi')\n")
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "-m", "impl"],
+            capture_output=True,
+        )
         assert detect_next_change_action(wt) == "done"
 
-    def test_multiple_changes_order(self, wt):
-        """First incomplete change is returned."""
-        for name in ["aaa-first", "bbb-second"]:
-            d = os.path.join(wt, "openspec", "changes", name)
-            os.makedirs(d)
-            with open(os.path.join(d, "tasks.md"), "w") as f:
-                f.write("- [x] Done\n")
-        # Second one incomplete
-        d2 = os.path.join(wt, "openspec", "changes", "bbb-second", "tasks.md")
-        with open(d2, "w") as f:
-            f.write("- [ ] Not done\n")
-        assert detect_next_change_action(wt) == "apply:bbb-second"
+    def test_multiple_changes_first_unchecked(self, wt):
+        """First change with unchecked tasks is returned."""
+        d1 = os.path.join(wt, "openspec", "changes", "aaa-first")
+        os.makedirs(d1)
+        with open(os.path.join(d1, "tasks.md"), "w") as f:
+            f.write("- [ ] Not started\n")
+        d2 = os.path.join(wt, "openspec", "changes", "bbb-second")
+        os.makedirs(d2)
+        with open(os.path.join(d2, "tasks.md"), "w") as f:
+            f.write("- [ ] Also not started\n")
+        assert detect_next_change_action(wt) == "apply:aaa-first"
 
     def test_archive_skipped(self, wt):
         """Archive directory is excluded from scan."""
@@ -142,16 +203,36 @@ class TestBuildClaudePrompt:
         )
         assert "/opsx:apply my-change" in prompt
 
-    def test_openspec_done_prompt(self, wt):
+    def test_openspec_done_prompt(self, tmp_dir):
+        import subprocess
+
+        wt = os.path.join(tmp_dir, "git-wt")
+        os.makedirs(os.path.join(wt, ".claude"))
+        subprocess.run(["git", "init", "-b", "main", wt], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "--allow-empty", "-m", "init"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", wt, "checkout", "-b", "change/my-change"],
+            capture_output=True,
+        )
         change_dir = os.path.join(wt, "openspec", "changes", "my-change")
         os.makedirs(change_dir)
         with open(os.path.join(change_dir, "tasks.md"), "w") as f:
             f.write("- [x] Done\n")
+        os.makedirs(os.path.join(wt, "src"))
+        with open(os.path.join(wt, "src", "app.tsx"), "w") as f:
+            f.write("export default function App() {}\n")
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", wt, "commit", "-m", "impl"],
+            capture_output=True,
+        )
         prompt = build_claude_prompt(
             "task", 1, 10, wt, done_criteria="openspec", target_change="my-change"
         )
         assert "ALL CHANGES COMPLETE" in prompt
-        # No reflection section when done
         assert "Reflection" not in prompt
 
     def test_manual_tasks_instruction(self, wt):

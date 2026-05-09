@@ -225,6 +225,20 @@ def get_previous_iteration_summary(wt_path: str) -> str:
 # ─── Internal helpers ─────────────────────────────────────────
 
 
+def _has_impl_files_in_diff(wt_path: str) -> bool:
+    """Check whether the branch has any non-spec implementation files."""
+    from .subprocess_utils import detect_default_branch, run_git
+
+    main_branch = detect_default_branch(wt_path)
+    diff_result = run_git(
+        "diff", "--name-only", f"{main_branch}...HEAD",
+        "--", ":!openspec/", ":!docs/",
+        cwd=wt_path, best_effort=True,
+    )
+    impl_files = [f for f in diff_result.stdout.strip().splitlines() if f]
+    return len(impl_files) > 0
+
+
 def _detect_for_target(wt_path: str, target_change: str) -> str:
     """Detect action for a specific change."""
     change_dir = os.path.join(wt_path, "openspec", "changes", target_change)
@@ -252,17 +266,7 @@ def _detect_for_target(wt_path: str, target_change: str) -> str:
     if unchecked > 0:
         return f"apply:{target_change}"
 
-    # All tasks checked — but is there actual implementation code?
-    # If tasks are [x] but no src/ files were added (stale branch from failed run),
-    # force re-implementation instead of declaring done.
-    from .git_utils import run_git
-    diff_result = run_git(
-        "diff", "--name-only", "main...HEAD", "--", "src/", "app/", "lib/", "components/", "pages/",
-        cwd=wt_path,
-    )
-    impl_files = [f for f in diff_result.stdout.strip().splitlines() if f]
-    if not impl_files:
-        # Tasks checked but no implementation files — stale artifact-only branch
+    if not _has_impl_files_in_diff(wt_path):
         return f"apply:{target_change}"
 
     return "done"
@@ -324,6 +328,9 @@ def _detect_scan_all(wt_path: str) -> str:
             unchecked = 0
 
         if unchecked > 0:
+            return f"apply:{change}"
+
+        if not _has_impl_files_in_diff(wt_path):
             return f"apply:{change}"
 
     return "done"
