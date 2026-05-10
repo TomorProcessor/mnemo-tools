@@ -747,6 +747,7 @@ class DispatchContext:
     cross_cutting_restrictions: list[str] = field(default_factory=list)
     review_learnings: str = ""
     review_learnings_checklist: str = ""
+    project_path: str = ""
 
 
 # ─── Worktree Preparation ────────────────────────────────────────────
@@ -2136,6 +2137,30 @@ def _build_input_content(
         for restriction in ctx.cross_cutting_restrictions:
             lines.append(f"- {restriction}")
 
+    # E2E test infrastructure context (profile-driven)
+    if ctx.project_path:
+        try:
+            from .profile_loader import load_profile
+            _profile = load_profile()
+            _infra = _profile.get_test_infra_summary(Path(ctx.project_path))
+            if any(_infra.get(k) for k in ("helper_files", "fixture_dirs", "patterns_detected")):
+                lines.append("\n## E2E Test Infrastructure")
+                if _infra.get("helper_files"):
+                    lines.append("**Existing helpers** (read before writing E2E tests):")
+                    for hf in _infra["helper_files"]:
+                        lines.append(f"- `{hf}`")
+                if _infra.get("fixture_dirs"):
+                    lines.append("**Fixture directories:**")
+                    for fd in _infra["fixture_dirs"]:
+                        lines.append(f"- `{fd}`")
+                if _infra.get("patterns_detected"):
+                    lines.append("**Detected patterns:**")
+                    for pat in _infra["patterns_detected"]:
+                        lines.append(f"- {pat}")
+                lines.append("")
+        except Exception:
+            logger.debug("E2E test infra summary failed for %s", change_name, exc_info=True)
+
     # NOTE: review_learnings and review_learnings_checklist are rendered at
     # the TOP of input.md (above ## Scope) so the agent reads them before
     # drafting code. The previous bottom-of-file rendering proved insufficient —
@@ -3052,6 +3077,7 @@ def dispatch_change(
         sibling_context=_build_sibling_context(state),
         review_learnings=review_learnings,
         review_learnings_checklist=review_checklist,
+        project_path=project_path,
     )
 
     # Cross-cutting file restrictions from planner ownership assignment

@@ -853,6 +853,22 @@ class ProjectType(ABC):
     def get_forbidden_patterns(self) -> list:
         return []
 
+    def get_test_infra_summary(self, project_path: Path) -> dict:
+        """Return a summary of existing E2E test infrastructure in the project.
+
+        Keys: helper_files (list[str]), fixture_dirs (list[str]),
+        patterns_detected (list[str]). Override in project-type modules.
+        """
+        return {"helper_files": [], "fixture_dirs": [], "patterns_detected": []}
+
+    def check_test_infra_usage(self, changed_files: list, project_path: Path) -> list[str]:
+        """Check if E2E tests use shared helpers vs inline definitions.
+
+        Returns warning strings for advisory logging. Non-blocking.
+        Override in project-type modules.
+        """
+        return []
+
     def generate_startup_file(self, project_path: str) -> str:
         """Generate START.md content for a project.
 

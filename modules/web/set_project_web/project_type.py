@@ -859,6 +859,100 @@ class WebProjectType(CoreProfile):
         return "\n".join(out)
 
     # ──────────────────────────────────────────────────────────────────
+    # E2E test infrastructure discovery
+    # ──────────────────────────────────────────────────────────────────
+
+    def get_test_infra_summary(self, project_path: Path) -> dict:
+        import glob
+        import re
+        result = {"helper_files": [], "fixture_dirs": [], "patterns_detected": []}
+        pp = Path(project_path)
+
+        # Scan helper files
+        helpers_dir = pp / "tests" / "e2e" / "helpers"
+        if helpers_dir.is_dir():
+            for f in sorted(helpers_dir.rglob("*.ts")):
+                result["helper_files"].append(str(f.relative_to(pp)))
+            for f in sorted(helpers_dir.rglob("*.js")):
+                result["helper_files"].append(str(f.relative_to(pp)))
+
+        # Scan fixture directories
+        fixtures_dir = pp / "tests" / "e2e" / "fixtures"
+        if fixtures_dir.is_dir():
+            result["fixture_dirs"].append(str(fixtures_dir.relative_to(pp)))
+            for d in sorted(fixtures_dir.iterdir()):
+                if d.is_dir():
+                    result["fixture_dirs"].append(str(d.relative_to(pp)))
+
+        # Detect patterns in spec files
+        spec_dir = pp / "tests" / "e2e"
+        if spec_dir.is_dir():
+            patterns_found = set()
+            for spec_file in spec_dir.glob("*.spec.ts"):
+                try:
+                    content = spec_file.read_text(errors="ignore")
+                    if "routeWebSocket" in content:
+                        patterns_found.add("Playwright routeWebSocket (WS mock pattern)")
+                    if "page.request.post" in content and "__test" in content:
+                        patterns_found.add("Seed data via test API endpoints (/api/__test/)")
+                    if "page.route(" in content:
+                        patterns_found.add("Playwright route interception (API mock)")
+                except Exception:
+                    pass
+            result["patterns_detected"].extend(sorted(patterns_found))
+
+        # Detect test route pages
+        for test_dir_name in ("__test", "(test)"):
+            test_routes = pp / "app" / test_dir_name
+            if test_routes.is_dir():
+                pages = list(test_routes.rglob("page.tsx")) + list(test_routes.rglob("page.ts"))
+                if pages:
+                    routes = [str(p.parent.relative_to(pp)) for p in pages]
+                    result["patterns_detected"].append(
+                        f"Test route pages: {', '.join(routes)}"
+                    )
+
+        return result
+
+    def check_test_infra_usage(self, changed_files: list, project_path: Path) -> list[str]:
+        import re
+        warnings = []
+        pp = Path(project_path)
+        helpers_dir = pp / "tests" / "e2e" / "helpers"
+        has_helpers = helpers_dir.is_dir() and any(helpers_dir.rglob("*.ts"))
+
+        if not has_helpers:
+            return warnings
+
+        helper_names = {f.stem for f in helpers_dir.rglob("*.ts")}
+
+        for f in changed_files:
+            fp = Path(f) if not Path(f).is_absolute() else Path(f)
+            if not str(fp).endswith(".spec.ts"):
+                continue
+            full_path = pp / fp if not fp.is_absolute() else fp
+            if not full_path.is_file():
+                continue
+            try:
+                content = full_path.read_text(errors="ignore")
+                inline_funcs = re.findall(
+                    r'^(?:async\s+)?function\s+(\w+)\s*\(',
+                    content,
+                    re.MULTILINE,
+                )
+                for func_name in inline_funcs:
+                    if func_name.startswith("test"):
+                        continue
+                    warnings.append(
+                        f"{fp.name} defines inline helper '{func_name}' — "
+                        f"consider moving to tests/e2e/helpers/"
+                    )
+            except Exception:
+                pass
+
+        return warnings
+
+    # ──────────────────────────────────────────────────────────────────
     # Category-resolver hooks (override the seven ABC methods + property
     # added in lib/set_orch/profile_types.py). Concrete patterns here
     # live in Layer 2 per modular-architecture.md — the core resolver

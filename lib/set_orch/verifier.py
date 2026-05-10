@@ -2722,6 +2722,22 @@ def _execute_scope_gate(
     output_lines = [f"Scope check passed: {len(all_files)} file(s) in diff."]
     if first:
         output_lines.append(f"  First impl: {first}")
+
+    # Test infra usage advisory (non-blocking)
+    try:
+        from .profile_loader import load_profile
+        profile = load_profile()
+        if hasattr(profile, 'check_test_infra_usage'):
+            from pathlib import Path
+            project_path = Path(wt_path).parent if wt_path else None
+            if project_path:
+                infra_warnings = profile.check_test_infra_usage(all_files, project_path)
+                for w in infra_warnings:
+                    logger.warning("[TEST-INFRA] %s: %s", change_name, w)
+                    output_lines.append(f"  [TEST-INFRA] {w}")
+    except Exception:
+        logger.debug("check_test_infra_usage failed for %s", change_name, exc_info=True)
+
     return GateResult("scope", "pass", output="\n".join(output_lines))
 
 

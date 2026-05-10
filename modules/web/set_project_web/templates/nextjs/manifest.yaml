@@ -24,6 +24,7 @@ core:
   - rules/transaction-safety.md
   - rules/seed-conventions.md
   - rules/web-conventions.md
+  - rules/e2e-test-layering.md
   - path: vitest.config.ts
     protected: true
   - path: playwright.config.ts
@@ -41,6 +42,7 @@ core:
   - path: .env.example
     protected: true
   - tests/e2e/global-setup.ts
+  - tests/e2e/helpers/README.md
   - messages/hu.json
   - messages/en.json
   - scripts/check-i18n-completeness.ts
