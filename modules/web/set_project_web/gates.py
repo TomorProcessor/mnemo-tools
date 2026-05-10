@@ -811,6 +811,38 @@ def _self_heal_testdir_drift(
     return (healed, declared or "<unset>", canonical, rerun_result)
 
 
+def _extract_webserver_diagnostics(output: str, max_lines: int = 30) -> str:
+    """Extract webServer diagnostic lines from e2e output.
+
+    Looks for the ``[run-e2e] webServer output`` section first (written by
+    the run-e2e.mjs wrapper on failure). Falls back to ``[WebServer]``
+    prefixed lines from Playwright's own output. If neither is found,
+    returns the last 50 lines of raw output so the agent has *something*.
+    """
+    # Priority 1: structured section from run-e2e.mjs wrapper
+    marker_start = "--- [run-e2e] webServer output"
+    marker_end = "--- end webServer output ---"
+    start = output.find(marker_start)
+    if start != -1:
+        end = output.find(marker_end, start)
+        section = output[start:end] if end != -1 else output[start:]
+        return f"\n## webServer Log\n```\n{section.strip()}\n```"
+
+    # Priority 2: [WebServer] prefixed lines from Playwright
+    ws_lines = [ln for ln in output.splitlines() if "[WebServer]" in ln]
+    if ws_lines:
+        tail = ws_lines[-max_lines:]
+        return "\n## webServer Log\n```\n" + "\n".join(tail) + "\n```"
+
+    # Priority 3: raw tail
+    all_lines = output.splitlines()
+    if all_lines:
+        tail = all_lines[-50:]
+        return "\n## Raw Output (tail)\n```\n" + "\n".join(tail) + "\n```"
+
+    return ""
+
+
 def _extract_e2e_failure_ids(output: str) -> set[str]:
     """Extract unique failure identifiers from Playwright output.
 
@@ -1505,6 +1537,7 @@ def execute_e2e_gate(
                 f"duration, test count, slow fixtures, network-bound tests. "
                 f"Consider increasing e2e_timeout or marking slow tests with a "
                 f"dedicated tag."
+                + _extract_webserver_diagnostics(e2e_output)
             ),
             stats=parse_test_output(e2e_output) if e2e_output else None,
         )
@@ -1639,6 +1672,7 @@ def execute_e2e_gate(
                     f"suite crashed before completing — check the worktree for stack "
                     f"traces, OOM kills, webServer startup errors, or a Playwright "
                     f"reporter that differs from the default."
+                    + _extract_webserver_diagnostics(e2e_output)
                 )
             if self_heal_pkg:
                 retry_ctx += (

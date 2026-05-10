@@ -3980,6 +3980,21 @@ def handle_change_done(
         change.verify_retry_index,
     )
 
+    # No-commit retry guard: if the agent declared done without committing
+    # any new work, don't consume retry budget. Re-dispatch with the same
+    # context — the agent might try a different approach next time.
+    if wt_path and verify_retry_count > 0:
+        from .engine import _has_commits_since_gate
+        _last_gate = (change.extras or {}).get("last_gate_commit", "")
+        if _last_gate and not _has_commits_since_gate(wt_path, _last_gate):
+            logger.warning(
+                "No-commit retry for %s: agent declared done without new commits "
+                "(HEAD == last_gate_commit %s). Re-dispatching without consuming "
+                "retry budget.", change_name, _last_gate[:8],
+            )
+            update_change_field(state_file, change_name, "status", "pending")
+            return
+
     if not wt_path:
         logger.warning("handle_change_done: wt_path empty for %s — critical checks will be skipped", change_name)
 
