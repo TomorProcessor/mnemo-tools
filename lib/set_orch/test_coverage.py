@@ -707,8 +707,8 @@ def _fuzzy_match(a: str, b: str) -> bool:
 
 # ─── REQ-ID Extraction ─────────────────────────────────────────
 
-_REQ_ID_RE = re.compile(r"REQ-[A-Z]+-\d+", re.IGNORECASE)
-_AC_ID_RE = re.compile(r"(REQ-[A-Z]+-\d+:AC-\d+)", re.IGNORECASE)
+_REQ_ID_RE = re.compile(r"REQ-(?:[A-Z0-9]+-)+\d+", re.IGNORECASE)
+_AC_ID_RE = re.compile(r"(REQ-(?:[A-Z0-9]+-)+\d+:AC-\d+)", re.IGNORECASE)
 
 
 def extract_req_ids(test_name: str) -> list[str]:
