@@ -118,6 +118,59 @@ describe('journalToAttemptGraph', () => {
     expect(g.terminal).toBe('merged')
   })
 
+  it('integration-merge-conflict retry classifies via retry_context (no merge_result delta)', () => {
+    // Regression: dimop-info i18n-setup-and-migration attempt #1 was retried
+    // because the integration merge conflicted with main. The verifier path
+    // (verifier.py:4138) sets `retry_context = "Integration merge conflict..."`
+    // between verify-failed and the next running, but never writes a
+    // merge_result delta — so the heuristic-only classifier falls through to
+    // 'unknown'. Reading retry_context lets us name the cause.
+    const entries: JournalEntry[] = [
+      entry('2026-05-08T08:23:14.859Z', 'current_step', 'planning', 1),
+      entry('2026-05-08T08:23:16.032Z', 'status', 'running', 2, 'dispatched'),
+      entry('2026-05-08T08:45:05.301Z', 'status', 'integrating', 3, 'running'),
+      entry('2026-05-08T08:45:05.337Z', 'status', 'verify-failed', 4, 'integrating'),
+      entry(
+        '2026-05-08T08:45:05.338Z',
+        'retry_context',
+        'Integration merge conflict: main has diverged from your branch.\n\nRun `git merge origin/main`...',
+        5,
+      ),
+      // engine clears retry_context shortly after — must NOT erase classification
+      entry('2026-05-08T08:45:05.356Z', 'retry_context', null, 6, 'Integration merge conflict: ...'),
+      entry('2026-05-08T08:45:05.358Z', 'current_step', 'fixing', 7, 'planning'),
+      entry('2026-05-08T08:45:06.612Z', 'status', 'running', 8, 'verify-failed'),
+    ]
+    const g = journalToAttemptGraph(entries)
+    expect(g.attempts).toHaveLength(2)
+    expect(g.attempts[0].outcome).toBe('retry')
+    expect(g.attempts[0].retryReason).toBe('merge-conflict')
+    expect(g.attempts[1].outcome).toBe('in-progress')
+  })
+
+  it('retry_context is scoped per attempt — does not leak into the next retry classification', () => {
+    // After a merge-conflict retry closes, the next attempt's classification
+    // must NOT inherit the prior retry_context. Here attempt #2 fails on a
+    // gate (no new retry_context written) and must be classified 'gate-fail',
+    // not 'merge-conflict'.
+    const entries: JournalEntry[] = [
+      entry('2026-05-08T10:00:00.000Z', 'status', 'running', 1, 'dispatched'),
+      entry('2026-05-08T10:01:00.000Z', 'status', 'integrating', 2, 'running'),
+      entry('2026-05-08T10:01:30.000Z', 'status', 'verify-failed', 3, 'integrating'),
+      entry('2026-05-08T10:01:31.000Z', 'retry_context', 'Integration merge conflict: main diverged', 4),
+      entry('2026-05-08T10:01:32.000Z', 'retry_context', null, 5, 'Integration merge conflict: main diverged'),
+      entry('2026-05-08T10:01:33.000Z', 'status', 'running', 6, 'verify-failed'),
+      entry('2026-05-08T10:02:00.000Z', 'status', 'integrating', 7, 'running'),
+      entry('2026-05-08T10:02:30.000Z', 'build_result', 'fail', 8),
+      entry('2026-05-08T10:02:31.000Z', 'status', 'verify-failed', 9, 'integrating'),
+      entry('2026-05-08T10:02:32.000Z', 'status', 'running', 10, 'verify-failed'),
+    ]
+    const g = journalToAttemptGraph(entries)
+    expect(g.attempts).toHaveLength(3)
+    expect(g.attempts[0].retryReason).toBe('merge-conflict')
+    expect(g.attempts[1].retryReason).toBe('gate-fail')
+  })
+
   it('interrupted attempt leaves terminal in-progress', () => {
     const entries: JournalEntry[] = [
       entry('2026-04-12T10:00:00.000Z', 'status', 'running', 1, 'dispatched'),

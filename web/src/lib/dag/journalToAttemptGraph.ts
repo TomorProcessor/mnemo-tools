@@ -132,11 +132,19 @@ export function journalToAttemptGraph(
     return attempt
   }
 
-  function closeAttemptOnRetry(attempt: Attempt, ts: string): void {
+  function closeAttemptOnRetry(attempt: Attempt, ts: string, ctx: string | null): void {
     attempt.endedAt = ts
     attempt.outcome = 'retry'
     const lastNode = attempt.nodes[attempt.nodes.length - 1]
+    const ctxLower = ctx ? ctx.toLowerCase() : ''
     if (lastNode && lastNode.kind === 'merge' && lastNode.result === 'fail') {
+      attempt.retryReason = 'merge-conflict'
+    } else if (ctxLower.includes('merge conflict')) {
+      // Integration-merge-conflict path: the engine retries before any gate
+      // node lands in the journal (verifier.py:4138 sets retry_context with
+      // "Integration merge conflict" between verify-failed and the next
+      // running). Without this branch the retry would be classified
+      // 'unknown' even though the retry_context names the cause.
       attempt.retryReason = 'merge-conflict'
     } else if (attempt.nodes.some((n) => n.result === 'fail')) {
       attempt.retryReason = 'gate-fail'
@@ -150,8 +158,19 @@ export function journalToAttemptGraph(
   }
 
   let pendingRetry = false
+  // Captures the latest non-null retry_context value so the next
+  // close-on-retry can classify the cause. The engine often clears
+  // retry_context (string → null) shortly after setting it; we only update
+  // on non-null deltas so the meaningful value isn't overwritten.
+  let pendingRetryContext: string | null = null
 
   for (const e of sorted) {
+    if (e.field === 'retry_context') {
+      if (typeof e.new === 'string' && e.new) {
+        pendingRetryContext = e.new
+      }
+      continue
+    }
     if (e.field === 'status') {
       const value = typeof e.new === 'string' ? e.new : ''
       const cur = current()
@@ -159,9 +178,10 @@ export function journalToAttemptGraph(
         if (!cur) {
           openNewAttempt(e.ts)
         } else if (pendingRetry) {
-          closeAttemptOnRetry(cur, e.ts)
+          closeAttemptOnRetry(cur, e.ts, pendingRetryContext)
           openNewAttempt(e.ts)
           pendingRetry = false
+          pendingRetryContext = null
         } else if (cur.outcome === 'failed' || cur.outcome === 'merged') {
           // Reset cycle: previous attempt reached a terminal state and is
           // now being redispatched (e.g. via reset_failed). Close history,
