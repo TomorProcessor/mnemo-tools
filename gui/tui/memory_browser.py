@@ -28,7 +28,7 @@ import unicodedata
 # ─── Constants ───────────────────────────────────────────────────────
 
 TYPE_FILTERS = ["all", "Decision", "Learning", "Context"]
-SORT_MODES = ["importance", "recency"]
+SORT_MODES = ["importance", "recency", "accessed"]
 LOAD_LIMIT = 2000
 
 # Color pair ids
@@ -180,7 +180,9 @@ class Browser:
             v = [m for m in v if matches(m, self.search)]
         if self.sort_mode == "importance":
             v = sorted(v, key=lambda m: _imp(m), reverse=True)
-        else:
+        elif self.sort_mode == "accessed":
+            v = sorted(v, key=lambda m: _acc(m), reverse=True)
+        else:  # recency
             v = sorted(
                 v,
                 key=lambda m: (m.get("last_accessed") or m.get("created_at") or ""),
@@ -201,6 +203,13 @@ def _imp(m):
         return float(m.get("importance") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _acc(m):
+    try:
+        return int(m.get("access_count") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 # ─── Rendering ───────────────────────────────────────────────────────
