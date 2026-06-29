@@ -72,6 +72,7 @@ Diagnostics:
 
 Introspection:
   get <id>                        Get a single memory by ID (JSON stdout)
+  ui [--all] [--project NAME]     Interactive curses browser for memory contents
   context [topic]                 Condensed summary by category
   brain                           3-tier memory visualization
   consolidation [--since ISO] [--events]
@@ -363,6 +364,7 @@ main() {
         status)   cmd_status "$@" ;;
         metrics)  cmd_metrics "$@" ;;
         tui)      cmd_tui "$@" ;;
+        ui|browse) cmd_ui "$@" ;;
         dashboard) cmd_dashboard "$@" ;;
         projects) cmd_projects "$@" ;;
         -h|--help|help) usage ;;

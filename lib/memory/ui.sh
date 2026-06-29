@@ -711,6 +711,69 @@ print('\n'.join(output_lines))
     fi
 }
 
+# Interactive curses browser for memory CONTENTS (list + search + detail).
+# Distinct from cmd_tui/cmd_dashboard, which are metrics/analytics views.
+cmd_ui() {
+    local show_all=false
+    local ui_project=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                show_all=true
+                shift
+                ;;
+            --project)
+                shift
+                ui_project="$1"
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: wt-memory ui [--all] [--project NAME]"
+                echo "Interactive curses browser for memory contents."
+                echo "Keys: jk/↑↓ move, →/Enter detail, ←/Esc list, / search, t type, s sort, r reload, q quit"
+                return 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    # Project scoping (mirror cmd_tui lines 117-123, but worktree-aware via resolve_project)
+    if [[ "$show_all" == "true" ]]; then
+        ui_project=""   # empty => ambient resolution, do not pin a project
+    else
+        if [[ -z "$ui_project" && -n "$PROJECT" ]]; then
+            ui_project="$PROJECT"
+        fi
+        if [[ -z "$ui_project" ]]; then
+            ui_project=$(resolve_project 2>/dev/null || true)
+        fi
+    fi
+
+    # curses needs a real TTY; bail cleanly otherwise (no terminal corruption)
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "wt-memory ui requires an interactive terminal (TTY)." >&2
+        return 1
+    fi
+
+    # curses is stdlib, so any python3 renders; prefer the shodh-capable one.
+    local py="${SHODH_PYTHON:-}"
+    if [[ -z "$py" ]]; then
+        py=$(find_python) || { echo "No python3 found." >&2; return 1; }
+    fi
+
+    local ui_script="$_wt_memory_bin_dir/../gui/tui/memory_browser.py"
+    if [[ ! -f "$ui_script" ]]; then
+        echo "Browser script missing: $ui_script" >&2
+        return 1
+    fi
+
+    exec "$py" "$ui_script" "$_wt_memory_bin_dir/.." "${ui_project:-}"
+}
+
 cmd_dashboard() {
     local since_days=30
 
