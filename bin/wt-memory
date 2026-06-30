@@ -22,6 +22,18 @@ if _sp=$(find_shodh_python 2>/dev/null); then
     SHODH_PYTHON="$_sp"
 fi
 
+# Locally-built shodh (0.1.81 with the access-count backport) uses ort in
+# "load-dynamic" mode and aborts unless it can find libonnxruntime.dylib. The
+# wheels bundle it at <pkg>/lib/libonnxruntime.dylib; point ort at it explicitly.
+# No-op when the file is absent or ORT_DYLIB_PATH is already set (so this stays
+# harmless on stock wheels that locate the dylib themselves).
+if [[ -z "${ORT_DYLIB_PATH:-}" && -n "$SHODH_PYTHON" ]]; then
+    _shodh_dir=$("$SHODH_PYTHON" -c 'import sys; sys._shodh_star_shown=True; import os,shodh_memory; print(os.path.dirname(shodh_memory.__file__))' 2>/dev/null | tail -1)
+    if [[ -n "$_shodh_dir" && -f "$_shodh_dir/lib/libonnxruntime.dylib" ]]; then
+        export ORT_DYLIB_PATH="$_shodh_dir/lib/libonnxruntime.dylib"
+    fi
+fi
+
 # Storage root (override with env var). Per-project dirs created underneath.
 SHODH_STORAGE="${SHODH_STORAGE:-${HOME}/.local/share/wt-tools/memory}"
 
