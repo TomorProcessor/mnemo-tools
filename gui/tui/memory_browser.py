@@ -38,6 +38,14 @@ LOAD_LIMIT = 2000
 STATS_MIN_H = 9
 STATS_MAX_H = 11
 
+# Charts dashboard, fixed at the bottom of the right pane (below the memory
+# detail). Header + divider + 4 chart sections (each ~2-3 rows + a blank) ≈ 18
+# for the full set; DASH_MIN_H is the floor below which we don't split the
+# right pane at all (detail takes the whole thing). The dashboard clips its
+# bottom charts when it gets less than the ideal.
+DASH_H = 18
+DASH_MIN_H = 8
+
 # Color pair ids
 CP_HEADER = 1
 CP_SELECTED = 2
@@ -188,7 +196,6 @@ class Browser:
         self.project = project
         self.status = ""
         self.show_stats = True
-        self.show_dashboard = False  # right-pane charts dashboard (toggle: S)
         self.stats = compute_stats(all_mems)
         self.access = access_buckets(all_mems)  # (hot, warm, cold)
         self.created_src = all_mems  # list to bucket at draw time (width-dependent)
@@ -450,11 +457,9 @@ def draw(stdscr, b):
 
     # ── Split the left column: list on top, stats panel on the bottom. ──
     # Only carve out stats when the panel is toggled on AND the list keeps a
-    # workable minimum of rows; otherwise the list takes the whole column. The
-    # bottom-left panel is redundant while the dashboard fills the right pane,
-    # so it's suppressed then (the list gets the whole column).
+    # workable minimum of rows; otherwise the list takes the whole column.
     stats_h = 0
-    if b.show_stats and not b.show_dashboard and b.view:
+    if b.show_stats and b.view:
         want = min(STATS_MAX_H, STATS_MIN_H + len(
             [1 for c in b.stats["types"].values() if c]
         ))
@@ -526,21 +531,30 @@ def draw(stdscr, b):
         except curses.error:
             pass
 
-    # ── Right pane ── charts dashboard (S) or the selected memory's detail.
+    # ── Right pane ── memory detail on top, charts dashboard fixed at the
+    # bottom (both always visible). The detail gets what's left after the
+    # dashboard band; on short panes the dashboard shrinks and detail keeps a
+    # minimum, and if there's no room to split we drop the dashboard.
     if detail_w > 4:
-        if b.show_dashboard:
-            _draw_dashboard(stdscr, b, body_top, body_h, detail_x, detail_w)
-        else:
-            _draw_detail(stdscr, b, body_top, body_h, detail_x, detail_w)
+        dash_h = 0
+        if body_h - DASH_MIN_H >= 6:  # keep the detail usable above it
+            dash_h = min(DASH_H, body_h - 6)
+        detail_h = body_h - dash_h
+        _draw_detail(stdscr, b, body_top, detail_h, detail_x, detail_w)
+        if dash_h >= DASH_MIN_H:
+            dash_top = body_top + detail_h
+            # Divider row between detail and dashboard.
+            safe_addstr(stdscr, dash_top, detail_x,
+                        "─" * max(0, detail_w - 1), _cp(CP_DIM))
+            _draw_dashboard(stdscr, b, dash_top + 1, dash_h - 1, detail_x, detail_w)
 
     # ── Footer ──
     if b.status:
         foot = " " + b.status + " "
     else:
-        dash = "S detail" if b.show_dashboard else "S dash"
         foot = (
             " jk move   Enter read   / search   "
-            "t type   s sort   {}   r reload   q quit ".format(dash)
+            "t type   s sort   r reload   q quit "
         )
     safe_addstr(stdscr, footer_row, 0, foot, _cp(CP_DIM))
 
@@ -724,7 +738,7 @@ def _sparkline(buckets):
 
 
 def _draw_dashboard(stdscr, b, top, height, x, w):
-    """Charts dashboard for the right pane (replaces the memory detail view).
+    """Charts dashboard fixed at the bottom of the right pane (below detail).
 
     Four sections top→bottom: importance (stacked bar), flags (three bars),
     access activity (stacked bar), and a created-over-time sparkline. Sections
@@ -763,11 +777,10 @@ def _draw_dashboard(stdscr, b, top, height, x, w):
         nonlocal y
         y += 1
 
+    # Compact single-line header (the caller already drew a divider above us).
     scope = "view" if (b.search or b.type_filter != "all") else "all"
-    safe_addstr(stdscr, y, x, "DASHBOARD", _cp(CP_HEADER) | curses.A_BOLD)
-    safe_addstr(stdscr, y, x + 10, "· {} mem ({})".format(total, scope), dim)
-    y += 1
-    safe_addstr(stdscr, y, x, "─" * inner_w, dim)
+    safe_addstr(stdscr, y, x, "CHARTS", _cp(CP_ACCENT) | curses.A_BOLD)
+    safe_addstr(stdscr, y, x + 7, "· {} mem ({})".format(total, scope), dim)
     y += 1
 
     # ── Importance ── high / mid / low partition the whole set.
@@ -992,9 +1005,6 @@ def handle_nav_key(b, ch, body_h):
         i = SORT_MODES.index(b.sort_mode)
         b.sort_mode = SORT_MODES[(i + 1) % len(SORT_MODES)]
         b.recompute_view()
-    elif ch == ord("S"):
-        b.show_dashboard = not b.show_dashboard
-        b.status = "dashboard {}".format("on" if b.show_dashboard else "off")
     elif ch in (ord("r"), ord("R")):
         b.all_mems = load_memories(b.project)
         b.recompute_view()
