@@ -24,12 +24,19 @@ import subprocess
 import sys
 import textwrap
 import unicodedata
+from datetime import datetime
 
 # ─── Constants ───────────────────────────────────────────────────────
 
 TYPE_FILTERS = ["all", "Decision", "Learning", "Context"]
 SORT_MODES = ["importance", "recency", "accessed"]
 LOAD_LIMIT = 2000
+
+# Stats panel (bottom of the left pane). Rows needed for a useful render:
+# divider + memories + up to 4 type rows + 2 importance + accesses ≈ 9.
+# Only shown when the list pane can spare at least this many rows for it.
+STATS_MIN_H = 9
+STATS_MAX_H = 11
 
 # Color pair ids
 CP_HEADER = 1
@@ -144,11 +151,21 @@ def matches(mem, q):
 
 
 def short_ts(s):
-    """Trim an ISO timestamp to 'YYYY-MM-DD HH:MM' for display."""
+    """Format an ISO timestamp as 'YYYY-MM-DD HH:MM' in the LOCAL timezone.
+
+    Stored timestamps are UTC (…+00:00). We parse and convert to the machine's
+    local zone so times read naturally. Falls back to a plain string trim if the
+    value can't be parsed (never raises — this feeds the render loop).
+    """
     if not s:
         return "—"
-    s = str(s).replace("T", " ")
-    return s[:16]
+    try:
+        dt = datetime.fromisoformat(str(s))
+        # Naive timestamps (no offset) are assumed local already; aware ones
+        # are converted from their zone (UTC) to local.
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return str(s).replace("T", " ")[:16]
 
 
 # ─── Application state ────────────────────────────────────────────────
@@ -170,6 +187,8 @@ class Browser:
         self.reader_scroll = 0
         self.project = project
         self.status = ""
+        self.show_stats = True
+        self.stats = compute_stats(all_mems)
         self.recompute_view()
 
     def recompute_view(self):
@@ -191,6 +210,10 @@ class Browser:
         self.view = v
         self.sel = clamp(self.sel, 0, max(0, len(v) - 1))
         self.detail_scroll = 0
+        # Stats follow the current view when a filter/search narrows it, so the
+        # panel is a live readout of what's on screen; otherwise the whole set.
+        filtering = bool(self.search) or self.type_filter != "all"
+        self.stats = compute_stats(self.view if filtering else self.all_mems)
 
     def current(self):
         if self.view and 0 <= self.sel < len(self.view):
@@ -210,6 +233,62 @@ def _acc(m):
         return int(m.get("access_count") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def compute_stats(mems):
+    """Aggregate a memory list into display stats (pure, no curses).
+
+    Returns a dict:
+      total          — count
+      types          — OrderedDict type→count (Decision/Learning/Context/Other)
+      importance     — dict with high/mid/low counts and mean
+      total_accesses — sum of access_count
+      flags          — dict failure/anomaly/compressed counts
+    """
+    total = len(mems)
+    types = {"Decision": 0, "Learning": 0, "Context": 0, "Other": 0}
+    high = mid = low = 0
+    imp_sum = 0.0
+    accesses = 0
+    failure = anomaly = compressed = 0
+    for m in mems:
+        t = m.get("experience_type")
+        types[t if t in types else "Other"] += 1
+        imp = _imp(m)
+        imp_sum += imp
+        if imp >= 0.8:
+            high += 1
+        elif imp >= 0.5:
+            mid += 1
+        else:
+            low += 1
+        accesses += _acc(m)
+        if m.get("is_failure"):
+            failure += 1
+        if m.get("is_anomaly"):
+            anomaly += 1
+        if m.get("compressed"):
+            compressed += 1
+    return {
+        "total": total,
+        "types": types,
+        "importance": {
+            "high": high, "mid": mid, "low": low,
+            "mean": (imp_sum / total) if total else 0.0,
+        },
+        "total_accesses": accesses,
+        "flags": {"failure": failure, "anomaly": anomaly, "compressed": compressed},
+    }
+
+
+def _mini_bar(count, total, width):
+    """Proportional block bar for `count` out of `total` over `width` cells."""
+    if width <= 0:
+        return ""
+    frac = (count / total) if total else 0.0
+    filled = int(round(frac * width))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
 
 
 # ─── Rendering ───────────────────────────────────────────────────────
@@ -273,6 +352,19 @@ def draw(stdscr, b):
     detail_x = list_w + 1
     detail_w = W - detail_x
 
+    # ── Split the left column: list on top, stats panel on the bottom. ──
+    # Only carve out stats when the panel is toggled on AND the list keeps a
+    # workable minimum of rows; otherwise the list takes the whole column.
+    stats_h = 0
+    if b.show_stats and b.view:
+        want = min(STATS_MAX_H, STATS_MIN_H + len(
+            [1 for c in b.stats["types"].values() if c]
+        ))
+        if body_h - want >= 6:  # keep the list usable
+            stats_h = want
+    list_h = body_h - stats_h
+    stats_top = body_top + list_h
+
     # ── Header ── (solid bar; brand + scope on the left, filters on the right)
     scope = b.project if b.project else "(all)"
     hdr_attr = _cp(CP_HEADER) | curses.A_BOLD
@@ -290,17 +382,17 @@ def draw(stdscr, b):
         safe_addstr(stdscr, search_row, 0, "/" + b.search + "▏", curses.A_BOLD)
 
     # ── List pane ──
-    _ensure_visible(b, body_h)
+    _ensure_visible(b, list_h)
     if not b.view:
         msg = "No memories"
         hint = "(filter/search active — press t/s/Esc, or r to reload)" if (
             b.search or b.type_filter != "all"
         ) else "(press r to reload, q to quit)"
-        cy = body_top + body_h // 2
+        cy = body_top + list_h // 2
         safe_addstr(stdscr, cy, max(0, (list_w - display_width(msg)) // 2), msg, _cp(CP_DIM))
         safe_addstr(stdscr, cy + 1, 1, truncate_to_width(hint, list_w - 2), _cp(CP_DIM))
     else:
-        for i in range(body_h):
+        for i in range(list_h):
             idx = b.list_top + i
             if idx >= len(b.view):
                 break
@@ -325,7 +417,11 @@ def draw(stdscr, b):
                 safe_addstr(stdscr, y, 0, line, _cp(CP_TITLE))
                 safe_addstr(stdscr, y, 1, badge, _type_attr(m.get("experience_type")) | curses.A_BOLD)
 
-    # ── Divider ──
+    # ── Stats panel (bottom of the left column) ──
+    if stats_h >= STATS_MIN_H:
+        _draw_stats(stdscr, b, stats_top, stats_h, list_w)
+
+    # ── Divider ── (full height of the body, spans list + stats)
     for i in range(body_h):
         try:
             stdscr.addch(body_top + i, list_w, curses.ACS_VLINE, _cp(CP_DIM))
@@ -342,7 +438,7 @@ def draw(stdscr, b):
     else:
         foot = (
             " jk move   Enter read   / search   "
-            "t type   s sort   r reload   q quit "
+            "t type   s sort   S stats   r reload   q quit "
         )
     safe_addstr(stdscr, footer_row, 0, foot, _cp(CP_DIM))
 
@@ -411,6 +507,76 @@ def _draw_detail(stdscr, b, top, body_h, x, w):
 
     for i, (text, attr) in enumerate(lines[:body_h]):
         safe_addstr(stdscr, top + i, x, text, attr)
+
+
+_TYPE_CP = {
+    "Decision": CP_DECISION,
+    "Learning": CP_LEARNING,
+    "Context": CP_CONTEXT,
+    "Other": CP_DIM,
+}
+
+
+def _draw_stats(stdscr, b, top, height, w):
+    """Render the stats panel in the bottom of the left pane.
+
+    `top` is the first row, `height` the number of rows available, `w` the pane
+    width. Content is drawn best-effort and clipped to `height`; the caller
+    guarantees height >= _STATS_MIN_H before calling.
+    """
+    s = b.stats
+    total = s["total"]
+    label_attr = _cp(CP_LABEL) | curses.A_BOLD
+    dim = _cp(CP_DIM)
+
+    # Section divider with a title, so the split from the list is obvious.
+    title = " STATS "
+    bar = "─" * max(0, (w - display_width(title)) // 2)
+    safe_addstr(stdscr, top, 0, bar, dim)
+    safe_addstr(stdscr, top, len(bar), title, _cp(CP_ACCENT) | curses.A_BOLD)
+    safe_addstr(stdscr, top, len(bar) + display_width(title),
+                "─" * max(0, w - len(bar) - display_width(title)), dim)
+
+    rows = []  # (segments) where segments is list of (text, attr)
+    scope = "view" if (b.search or b.type_filter != "all") else "total"
+    rows.append([("Memories  ", label_attr), ("{} ({})".format(total, scope), _cp(CP_TITLE))])
+
+    # Type distribution with proportional bars.
+    bar_w = max(4, min(12, w - 22))
+    for t, c in s["types"].items():
+        if c == 0:
+            continue
+        rows.append([
+            ("{:<9}".format(t[:9]), _cp(_TYPE_CP.get(t, CP_DIM)) | curses.A_BOLD),
+            (" " + _mini_bar(c, total, bar_w), _cp(CP_BAR)),
+            (" {:>4}".format(c), _cp(CP_TITLE)),
+        ])
+
+    imp = s["importance"]
+    rows.append([("Importance", label_attr)])
+    rows.append([
+        ("  ⭐{}  🔥{}  ·{}".format(imp["high"], imp["mid"], imp["low"]), _cp(CP_TITLE)),
+        ("  μ{:.2f}".format(imp["mean"]), dim),
+    ])
+
+    rows.append([("Accesses  ", label_attr), ("{} total".format(s["total_accesses"]), _cp(CP_TITLE))])
+
+    fl = s["flags"]
+    if fl["failure"] or fl["anomaly"]:
+        rows.append([
+            ("Flags     ", label_attr),
+            ("⚑{} failure  ⚑{} anomaly".format(fl["failure"], fl["anomaly"]),
+             _cp(CP_FLAG) | curses.A_BOLD),
+        ])
+
+    for i, segs in enumerate(rows):
+        y = top + 1 + i
+        if y >= top + height:
+            break
+        x = 0
+        for text, attr in segs:
+            safe_addstr(stdscr, y, x, text, attr)
+            x += display_width(text)
 
 
 def _draw_reader(stdscr, b, H, W):
@@ -575,6 +741,9 @@ def handle_nav_key(b, ch, body_h):
         i = SORT_MODES.index(b.sort_mode)
         b.sort_mode = SORT_MODES[(i + 1) % len(SORT_MODES)]
         b.recompute_view()
+    elif ch == ord("S"):
+        b.show_stats = not b.show_stats
+        b.status = "stats {}".format("on" if b.show_stats else "off")
     elif ch in (ord("r"), ord("R")):
         b.all_mems = load_memories(b.project)
         b.recompute_view()
