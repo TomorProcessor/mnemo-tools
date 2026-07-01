@@ -16,6 +16,7 @@ suppression, and graceful `[]` fallback — the browser never opens the store
 directly.
 """
 
+import collections
 import curses
 import json
 import os
@@ -199,6 +200,7 @@ class Browser:
         self.stats = compute_stats(all_mems)
         self.access = access_buckets(all_mems)  # (hot, warm, cold)
         self.created_src = all_mems  # list to bucket at draw time (width-dependent)
+        self.top_src = all_mems  # source for Top Tags + Age (scoped like stats)
         self.recompute_view()
 
     def recompute_view(self):
@@ -229,6 +231,7 @@ class Browser:
         self.stats = compute_stats(src)
         self.access = access_buckets(src)
         self.created_src = src
+        self.top_src = src
 
     def current(self):
         if self.view and 0 <= self.sel < len(self.view):
@@ -392,6 +395,39 @@ def created_series(mems, n):
             idx = min(n - 1, int((d - lo).total_seconds() / span * n))
         buckets[idx] += 1
     return buckets, lo, hi
+
+
+def top_tags(mems, limit):
+    """Return the `limit` most-common (tag, count) pairs across `mems`.
+
+    Most-common first; empty list when there are no tags. Pure, no curses.
+    """
+    c = collections.Counter()
+    for m in mems:
+        for t in (m.get("tags") or []):
+            if t:
+                c[t] += 1
+    return c.most_common(max(0, limit))
+
+
+def created_range(mems):
+    """Earliest and latest created_at as local datetimes, or (None, None).
+
+    Same parse/convert contract as short_ts and created_series: aware UTC
+    timestamps are converted to local; missing/unparseable values are skipped.
+    """
+    dts = []
+    for m in mems:
+        s = m.get("created_at")
+        if not s:
+            continue
+        try:
+            dts.append(datetime.fromisoformat(str(s)).astimezone())
+        except (ValueError, TypeError):
+            continue
+    if not dts:
+        return None, None
+    return min(dts), max(dts)
 
 
 # ─── Rendering ───────────────────────────────────────────────────────
@@ -653,12 +689,23 @@ def _draw_stats(stdscr, b, top, height, w):
     safe_addstr(stdscr, top, len(bar) + display_width(title),
                 "─" * max(0, w - len(bar) - display_width(title)), dim)
 
+    # Two-column layout: the existing stats keep a fixed-width left column, and
+    # (when the pane is wide enough) Top Tags + Age fill the right column so the
+    # horizontal space is used instead of left blank. Narrow panes fall back to
+    # a single column.
+    left_w = 26
+    right_x = left_w + 1  # 1-cell gutter
+    right_w = w - right_x
+    two_col = right_w >= 19  # pane must be >= ~46 cells for a useful 2nd column
+
     rows = []  # (segments) where segments is list of (text, attr)
     scope = "view" if (b.search or b.type_filter != "all") else "total"
     rows.append([("Memories  ", label_attr), ("{} ({})".format(total, scope), _cp(CP_TITLE))])
 
-    # Type distribution with proportional bars.
-    bar_w = max(4, min(12, w - 22))
+    # Type distribution with proportional bars. Sized so label(9) + space +
+    # bar + " NNNN"(5) fits the left column budget (left_w-1 in two-col mode).
+    type_span = (left_w - 1 if two_col else w)
+    bar_w = max(4, min(12, type_span - 15))
     for t, c in s["types"].items():
         if c == 0:
             continue
@@ -679,20 +726,70 @@ def _draw_stats(stdscr, b, top, height, w):
 
     fl = s["flags"]
     if fl["failure"] or fl["anomaly"]:
+        # Compact form in two-column mode so it fits the narrow left column.
+        flag_txt = ("⚑{}f ⚑{}a".format(fl["failure"], fl["anomaly"]) if two_col
+                    else "⚑{} failure  ⚑{} anomaly".format(fl["failure"], fl["anomaly"]))
         rows.append([
             ("Flags     ", label_attr),
-            ("⚑{} failure  ⚑{} anomaly".format(fl["failure"], fl["anomaly"]),
-             _cp(CP_FLAG) | curses.A_BOLD),
+            (flag_txt, _cp(CP_FLAG) | curses.A_BOLD),
         ])
 
-    for i, segs in enumerate(rows):
+    # ── Right column: Top Tags leaderboard + Age (only when wide enough) ──
+    right_rows = []
+    if two_col:
+        capacity = height - 1  # rows below the title
+        # Age line + a blank spacer cost 2 rows; the header costs 1. The rest
+        # are tag rows.
+        n_tags = max(0, capacity - 3)
+        right_rows.append([("TOP TAGS", label_attr)])
+        tags = top_tags(b.top_src, n_tags)
+        top_count = tags[0][1] if tags else 0
+        # Tag labels matter most, so give them the room: a compact count on the
+        # right, a small bar, and the label takes whatever's left.
+        count_w = 4  # " NNN"
+        tbar_w = max(3, min(5, right_w - 14))
+        label_w = max(6, right_w - tbar_w - count_w - 1)
+        for tag, c in tags:
+            right_rows.append([
+                (truncate_to_width(tag, label_w).ljust(label_w), _cp(CP_TITLE)),
+                (" " + _mini_bar(c, top_count, tbar_w), _cp(CP_BAR)),
+                ("{:>3}".format(c), _cp(CP_TITLE)),
+            ])
+        if not tags:
+            right_rows.append([("(no tags)", dim)])
+        right_rows.append([("", 0)])  # spacer
+        lo, hi = created_range(b.top_src)
+        if lo is not None:
+            span = "{}→{}".format(lo.strftime("%m-%d"), hi.strftime("%m-%d"))
+        else:
+            span = "—"
+        right_rows.append([("Age  ", label_attr), (span, _cp(CP_TITLE))])
+
+    # ── Render both columns row-by-row, clipped to `height`. ──
+    # In two-column mode the left content is bounded to `left_w` (with a 1-cell
+    # gutter) so wide rows (Flags, Memories) never bleed into the right column.
+    left_bound = left_w - 1 if two_col else w
+    n = max(len(rows), len(right_rows))
+    for i in range(n):
         y = top + 1 + i
         if y >= top + height:
             break
-        x = 0
-        for text, attr in segs:
-            safe_addstr(stdscr, y, x, text, attr)
-            x += display_width(text)
+        if i < len(rows):
+            x = 0
+            for text, attr in rows[i]:
+                text = truncate_to_width(text, max(0, left_bound - x))
+                if not text:
+                    continue
+                safe_addstr(stdscr, y, x, text, attr)
+                x += display_width(text)
+        if two_col and i < len(right_rows):
+            x = right_x
+            for text, attr in right_rows[i]:
+                text = truncate_to_width(text, right_x + right_w - x)
+                if not text:
+                    continue
+                safe_addstr(stdscr, y, x, text, attr)
+                x += display_width(text)
 
 
 def _draw_stacked_bar(stdscr, y, x, width, segments):
