@@ -188,7 +188,10 @@ class Browser:
         self.project = project
         self.status = ""
         self.show_stats = True
+        self.show_dashboard = False  # right-pane charts dashboard (toggle: S)
         self.stats = compute_stats(all_mems)
+        self.access = access_buckets(all_mems)  # (hot, warm, cold)
+        self.created_src = all_mems  # list to bucket at draw time (width-dependent)
         self.recompute_view()
 
     def recompute_view(self):
@@ -211,9 +214,14 @@ class Browser:
         self.sel = clamp(self.sel, 0, max(0, len(v) - 1))
         self.detail_scroll = 0
         # Stats follow the current view when a filter/search narrows it, so the
-        # panel is a live readout of what's on screen; otherwise the whole set.
+        # panel/dashboard is a live readout of what's on screen; otherwise the
+        # whole set. The created histogram is bucketed at draw time (its bucket
+        # count depends on pane width), so we only stash the source list here.
         filtering = bool(self.search) or self.type_filter != "all"
-        self.stats = compute_stats(self.view if filtering else self.all_mems)
+        src = self.view if filtering else self.all_mems
+        self.stats = compute_stats(src)
+        self.access = access_buckets(src)
+        self.created_src = src
 
     def current(self):
         if self.view and 0 <= self.sel < len(self.view):
@@ -291,6 +299,94 @@ def _mini_bar(count, total, width):
     return "█" * filled + "░" * (width - filled)
 
 
+def apportion(counts, width):
+    """Split `width` cells among `counts` proportionally, summing to exactly
+    `width` (largest-remainder / Hamilton method).
+
+    `counts` is a list of ints. Returns a list of ints the same length, each
+    >= 0, summing to `width`. Non-zero counts get at least 1 cell so a
+    present-but-tiny slice never vanishes — as long as the number of non-zero
+    slices fits in `width` (else the min-1 bump is trimmed from the largest).
+    Returns all-zero when total or width is 0.
+    """
+    total = sum(counts)
+    if total <= 0 or width <= 0:
+        return [0] * len(counts)
+    exact = [c / total * width for c in counts]
+    floors = [int(x) for x in exact]
+    # Guarantee a visible cell for any non-zero slice when there's room.
+    nonzero = sum(1 for c in counts if c > 0)
+    if nonzero <= width:
+        for i, c in enumerate(counts):
+            if c > 0 and floors[i] == 0:
+                floors[i] = 1
+    remainder = width - sum(floors)
+    if remainder > 0:
+        # Hand out the leftover cells to the largest fractional parts.
+        order = sorted(range(len(counts)), key=lambda i: exact[i] - floors[i], reverse=True)
+        for i in order[:remainder]:
+            floors[i] += 1
+    elif remainder < 0:
+        # The min-1 bump over-allocated; trim from the largest slices (keep >=1).
+        order = sorted(range(len(counts)), key=lambda i: floors[i], reverse=True)
+        k = 0
+        while remainder < 0 and k < len(order):
+            i = order[k]
+            if floors[i] > 1:
+                floors[i] -= 1
+                remainder += 1
+            else:
+                k += 1
+    return floors
+
+
+def access_buckets(mems):
+    """Split memories into (hot, warm, cold) by access_count: 3+, 1–2, 0."""
+    hot = warm = cold = 0
+    for m in mems:
+        a = _acc(m)
+        if a >= 3:
+            hot += 1
+        elif a >= 1:
+            warm += 1
+        else:
+            cold += 1
+    return hot, warm, cold
+
+
+def created_series(mems, n):
+    """Bucket memories into `n` equal-duration buckets over their created_at span.
+
+    Returns (buckets, lo, hi) where buckets is a length-`n` list of counts, and
+    lo/hi are the earliest/latest local datetimes (or None when no valid dates).
+    Timestamps are parsed as UTC-aware and converted to local, consistent with
+    short_ts. Unparseable/missing created_at values are skipped.
+    """
+    if n <= 0:
+        return [], None, None
+    dts = []
+    for m in mems:
+        s = m.get("created_at")
+        if not s:
+            continue
+        try:
+            dts.append(datetime.fromisoformat(str(s)).astimezone())
+        except (ValueError, TypeError):
+            continue
+    buckets = [0] * n
+    if not dts:
+        return buckets, None, None
+    lo, hi = min(dts), max(dts)
+    span = (hi - lo).total_seconds()
+    for d in dts:
+        if span <= 0:
+            idx = 0
+        else:
+            idx = min(n - 1, int((d - lo).total_seconds() / span * n))
+        buckets[idx] += 1
+    return buckets, lo, hi
+
+
 # ─── Rendering ───────────────────────────────────────────────────────
 
 
@@ -354,9 +450,11 @@ def draw(stdscr, b):
 
     # ── Split the left column: list on top, stats panel on the bottom. ──
     # Only carve out stats when the panel is toggled on AND the list keeps a
-    # workable minimum of rows; otherwise the list takes the whole column.
+    # workable minimum of rows; otherwise the list takes the whole column. The
+    # bottom-left panel is redundant while the dashboard fills the right pane,
+    # so it's suppressed then (the list gets the whole column).
     stats_h = 0
-    if b.show_stats and b.view:
+    if b.show_stats and not b.show_dashboard and b.view:
         want = min(STATS_MAX_H, STATS_MIN_H + len(
             [1 for c in b.stats["types"].values() if c]
         ))
@@ -428,17 +526,21 @@ def draw(stdscr, b):
         except curses.error:
             pass
 
-    # ── Detail pane ──
+    # ── Right pane ── charts dashboard (S) or the selected memory's detail.
     if detail_w > 4:
-        _draw_detail(stdscr, b, body_top, body_h, detail_x, detail_w)
+        if b.show_dashboard:
+            _draw_dashboard(stdscr, b, body_top, body_h, detail_x, detail_w)
+        else:
+            _draw_detail(stdscr, b, body_top, body_h, detail_x, detail_w)
 
     # ── Footer ──
     if b.status:
         foot = " " + b.status + " "
     else:
+        dash = "S detail" if b.show_dashboard else "S dash"
         foot = (
             " jk move   Enter read   / search   "
-            "t type   s sort   S stats   r reload   q quit "
+            "t type   s sort   {}   r reload   q quit ".format(dash)
         )
     safe_addstr(stdscr, footer_row, 0, foot, _cp(CP_DIM))
 
@@ -577,6 +679,155 @@ def _draw_stats(stdscr, b, top, height, w):
         for text, attr in segs:
             safe_addstr(stdscr, y, x, text, attr)
             x += display_width(text)
+
+
+def _draw_stacked_bar(stdscr, y, x, width, segments):
+    """Draw a single-row multi-color stacked bar.
+
+    `segments` is a list of (count, color_pair). Cell widths are apportioned so
+    they sum to exactly `width` (largest-remainder); each segment is a separate
+    `safe_addstr` (one attr per call) drawn at an advancing x. Any leftover from
+    an all-zero bar is filled with `░` in the dim color.
+    """
+    if width <= 0:
+        return
+    cells = apportion([max(0, c) for c, _ in segments], width)
+    cx = x
+    drawn = 0
+    for (_, cp), n in zip(segments, cells):
+        if n <= 0:
+            continue
+        safe_addstr(stdscr, y, cx, "█" * n, _cp(cp))
+        cx += n
+        drawn += n
+    if drawn < width:
+        safe_addstr(stdscr, y, cx, "░" * (width - drawn), _cp(CP_DIM))
+
+
+def _sparkline(buckets):
+    """Map a list of counts to a sparkline string using ▁▂▃▄▅▆▇█.
+
+    Heights are relative to the tallest bucket; an empty bucket renders as a
+    space so gaps in time read as gaps in the chart.
+    """
+    blocks = "▁▂▃▄▅▆▇█"
+    peak = max(buckets) if buckets else 0
+    if peak <= 0:
+        return " " * len(buckets)
+    out = []
+    for b_ in buckets:
+        if b_ <= 0:
+            out.append(" ")
+        else:
+            out.append(blocks[min(len(blocks) - 1, int((b_ / peak) * (len(blocks) - 1)))])
+    return "".join(out)
+
+
+def _draw_dashboard(stdscr, b, top, height, x, w):
+    """Charts dashboard for the right pane (replaces the memory detail view).
+
+    Four sections top→bottom: importance (stacked bar), flags (three bars),
+    access activity (stacked bar), and a created-over-time sparkline. Sections
+    are drawn until vertical space runs out (bottom-up clip), matching the
+    file's clip-don't-crash style.
+    """
+    s = b.stats
+    total = s["total"]
+    label_attr = _cp(CP_LABEL) | curses.A_BOLD
+    dim = _cp(CP_DIM)
+    inner_w = max(4, w - 1)
+    bar_w = max(6, min(inner_w, w - 14))  # leave room for a label + count
+    y = top
+    bottom = top + height
+
+    def title(text):
+        nonlocal y
+        if y >= bottom:
+            return False
+        safe_addstr(stdscr, y, x, text, _cp(CP_ACCENT) | curses.A_BOLD)
+        y += 1
+        return True
+
+    def row(segs):
+        nonlocal y
+        if y >= bottom:
+            return False
+        cx = x
+        for text, attr in segs:
+            safe_addstr(stdscr, y, cx, text, attr)
+            cx += display_width(text)
+        y += 1
+        return True
+
+    def blank():
+        nonlocal y
+        y += 1
+
+    scope = "view" if (b.search or b.type_filter != "all") else "all"
+    safe_addstr(stdscr, y, x, "DASHBOARD", _cp(CP_HEADER) | curses.A_BOLD)
+    safe_addstr(stdscr, y, x + 10, "· {} mem ({})".format(total, scope), dim)
+    y += 1
+    safe_addstr(stdscr, y, x, "─" * inner_w, dim)
+    y += 1
+
+    # ── Importance ── high / mid / low partition the whole set.
+    imp = s["importance"]
+    if title("IMPORTANCE"):
+        if y < bottom:
+            _draw_stacked_bar(stdscr, y, x, bar_w, [
+                (imp["high"], CP_ACCENT), (imp["mid"], CP_BAR), (imp["low"], CP_DIM)
+            ])
+            y += 1
+        row([
+            ("⭐{}  ".format(imp["high"]), _cp(CP_ACCENT)),
+            ("🔥{}  ".format(imp["mid"]), _cp(CP_BAR)),
+            ("·{}".format(imp["low"]), dim),
+            ("   μ{:.2f}".format(imp["mean"]), _cp(CP_TITLE)),
+        ])
+    blank()
+
+    # ── Flags ── overlapping sets, so one independent bar each.
+    fl = s["flags"]
+    if title("FLAGS"):
+        fbar = max(6, min(inner_w, w - 16))
+        for name, cp in (("failure", CP_FLAG), ("anomaly", CP_ACCENT), ("compressed", CP_CONTEXT)):
+            c = fl[name]
+            row([
+                ("{:<11}".format(name), _cp(cp) | curses.A_BOLD),
+                (_mini_bar(c, total, fbar), _cp(cp)),
+                (" {:>4}".format(c), _cp(CP_TITLE)),
+            ])
+    blank()
+
+    # ── Access activity ── hot / warm / cold partition the whole set.
+    hot, warm, cold = b.access
+    if title("ACCESS"):
+        if y < bottom:
+            _draw_stacked_bar(stdscr, y, x, bar_w, [
+                (hot, CP_BAR), (warm, CP_ACCENT), (cold, CP_DIM)
+            ])
+            y += 1
+        row([
+            ("hot {}  ".format(hot), _cp(CP_BAR)),
+            ("warm {}  ".format(warm), _cp(CP_ACCENT)),
+            ("cold {}".format(cold), dim),
+        ])
+    blank()
+
+    # ── Created over time ── equal-width buckets across the full span.
+    if title("CREATED"):
+        chart_w = max(1, inner_w)
+        buckets, lo, hi = created_series(b.created_src, chart_w)
+        if lo is None:
+            row([("no dates", dim)])
+        else:
+            spark = _sparkline(buckets)
+            row([(spark, _cp(CP_BAR))])
+            peak = max(buckets) if buckets else 0
+            axis = "{} → {}   peak {}".format(
+                lo.strftime("%m-%d"), hi.strftime("%m-%d"), peak
+            )
+            row([(truncate_to_width(axis, inner_w), dim)])
 
 
 def _draw_reader(stdscr, b, H, W):
@@ -742,8 +993,8 @@ def handle_nav_key(b, ch, body_h):
         b.sort_mode = SORT_MODES[(i + 1) % len(SORT_MODES)]
         b.recompute_view()
     elif ch == ord("S"):
-        b.show_stats = not b.show_stats
-        b.status = "stats {}".format("on" if b.show_stats else "off")
+        b.show_dashboard = not b.show_dashboard
+        b.status = "dashboard {}".format("on" if b.show_dashboard else "off")
     elif ch in (ord("r"), ord("R")):
         b.all_mems = load_memories(b.project)
         b.recompute_view()
