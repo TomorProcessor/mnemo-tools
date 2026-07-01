@@ -703,16 +703,16 @@ def _draw_stats(stdscr, b, top, height, w):
     rows.append([("Memories  ", label_attr), ("{} ({})".format(total, scope), _cp(CP_TITLE))])
 
     # Type distribution with proportional bars. Sized so label(9) + space +
-    # bar + " NNNN"(5) fits the left column budget (left_w-1 in two-col mode).
+    # bar + "  NNNN"(6) fits the left column budget (left_w-1 in two-col mode).
     type_span = (left_w - 1 if two_col else w)
-    bar_w = max(4, min(12, type_span - 15))
+    bar_w = max(4, min(12, type_span - 16))
     for t, c in s["types"].items():
         if c == 0:
             continue
         rows.append([
             ("{:<9}".format(t[:9]), _cp(_TYPE_CP.get(t, CP_DIM)) | curses.A_BOLD),
             (" " + _mini_bar(c, total, bar_w), _cp(CP_BAR)),
-            (" {:>4}".format(c), _cp(CP_TITLE)),
+            ("  {:>4}".format(c), _cp(CP_TITLE)),
         ])
 
     imp = s["importance"]
@@ -746,14 +746,15 @@ def _draw_stats(stdscr, b, top, height, w):
         top_count = tags[0][1] if tags else 0
         # Tag labels matter most, so give them the room: a compact count on the
         # right, a small bar, and the label takes whatever's left.
-        count_w = 4  # " NNN"
+        count_w = 5  # "  NNN" (2-space gap + up to 3 digits)
         tbar_w = max(3, min(5, right_w - 14))
-        label_w = max(6, right_w - tbar_w - count_w - 1)
+        # -2: 1-cell gutter after the count + safe_addstr never uses the last col.
+        label_w = max(6, right_w - tbar_w - count_w - 2)
         for tag, c in tags:
             right_rows.append([
                 (truncate_to_width(tag, label_w).ljust(label_w), _cp(CP_TITLE)),
                 (" " + _mini_bar(c, top_count, tbar_w), _cp(CP_BAR)),
-                ("{:>3}".format(c), _cp(CP_TITLE)),
+                ("  {:>3}".format(c), _cp(CP_TITLE)),
             ])
         if not tags:
             right_rows.append([("(no tags)", dim)])
