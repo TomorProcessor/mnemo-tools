@@ -617,13 +617,18 @@ def team_resource() -> str:
 
 # Project dir for memory tools — set at registration time by wt-project init
 MEMORY_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR")
+MEMORY_PROJECT = os.environ.get("WT_MEMORY_PROJECT")
 
 
 def _run_memory(args: list[str], input_text: str | None = None, timeout: int = 30) -> str:
     """Run a wt-memory CLI command with project-scoped CWD."""
+    cmd = ["wt-memory"]
+    if MEMORY_PROJECT:
+        cmd.extend(["--project", MEMORY_PROJECT])
+    cmd.extend(args)
     try:
         result = subprocess.run(
-            ["wt-memory"] + args,
+            cmd,
             input=input_text,
             capture_output=True,
             text=True,

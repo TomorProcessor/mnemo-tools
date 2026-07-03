@@ -37,8 +37,9 @@ fi
 # Storage root (override with env var). Per-project dirs created underneath.
 SHODH_STORAGE="${SHODH_STORAGE:-${HOME}/.local/share/wt-tools/memory}"
 
-# Global --project override (set by main before dispatch)
-PROJECT=""
+# Global --project override (set by main before dispatch). WT_MEMORY_PROJECT
+# lets shell/MCP launchers pin a default while still allowing --project to win.
+PROJECT="${WT_MEMORY_PROJECT:-}"
 
 usage() {
     cat <<EOF
