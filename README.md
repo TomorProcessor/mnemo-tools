@@ -5,6 +5,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Linux & macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)]()
 
+> [!NOTE]
+> **This is a fork.** `mnemo-tools` is a fork of [tatargabor/wt-tools](https://github.com/tatargabor/wt-tools), focused on the **developer-memory subsystem**. It diverged from upstream on 2026-03-11 (commit `636ce7b7`) and does not track upstream's later development.
+>
+> **What this fork adds** (not in upstream `main`):
+> - **`wt-memory ui`** — an interactive terminal (curses) browser for the memory store: sortable memory list (including by access count), local-timezone timestamps, a stats panel with top tags and age distribution, and a charts dashboard.
+> - **`wt-memory init`** — one-command CLAUDE.md setup for the persistent-memory instructions.
+> - **shodh-memory build support** — `wt-memory` auto-exports `ORT_DYLIB_PATH` so `load-dynamic` builds of shodh-memory work out of the box.
+> - **Portability fixes** — Bash 3.2 compatibility in `wt-audit`, portable `awk` instead of `sed -i`, graceful handling of `curl-cffi` install failures, and CI fixes.
+
 ---
 
 ## Why wt-tools?
